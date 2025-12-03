@@ -143,7 +143,7 @@ CMAPS = {
     "dist_to_river_m": "magma",
     "drainage_density_km_per_km2": "plasma",
     "soil_sand_pct": "cividis",
-    "lulc_osm_proxy": "tab10",
+    "lulc_worldcover_proxy": "tab10",
 }
 
 # Toggles + opacity
@@ -163,7 +163,7 @@ show_soil = st.sidebar.checkbox("Soil sand fraction (%)", value=False, key="togg
 soil_opacity = st.sidebar.slider("Soil sand opacity", 0.0, 1.0, 0.6, 0.05, key="opacity_soil")
 
 st.sidebar.markdown("---")
-show_lulc = st.sidebar.checkbox("LULC (OSM proxy)", value=False, key="toggle_lulc")
+show_lulc = st.sidebar.checkbox("LULC (worldcover proxy)", value=False, key="toggle_lulc")
 lulc_opacity = st.sidebar.slider("LULC opacity", 0.0, 1.0, 0.6, 0.05, key="opacity_lulc")
 
 # --------------- Map Build ----------------
@@ -208,10 +208,10 @@ if show_soil and "soil_sand_pct" in paths and os.path.exists(paths["soil_sand_pc
     add_image_overlay(m, img, raster_bounds_latlon(p), "Soil sand fraction (%)", opacity=soil_opacity)
     add_onmap_legend(m, make_continuous_legend_png(CMAPS["soil_sand_pct"], svmin, svmax, "Soil sand fraction (%)"), position=next_pos())
 
-if show_lulc and "lulc_osm_proxy" in paths and os.path.exists(paths["lulc_osm_proxy"]):
-    p = paths["lulc_osm_proxy"]
-    img, _ = raster_to_rgba_image(p, cmap_name=CMAPS["lulc_osm_proxy"])
-    add_image_overlay(m, img, raster_bounds_latlon(p), "LULC (OSM proxy)", opacity=lulc_opacity)
+if show_lulc and "lulc_worldcover_proxy" in paths and os.path.exists(paths["lulc_worldcover_proxy"]):
+    p = paths["lulc_worldcover_proxy"]
+    img, _ = raster_to_rgba_image(p, cmap_name=CMAPS["lulc_worldcover_proxy"])
+    add_image_overlay(m, img, raster_bounds_latlon(p), "LULC (worldcover proxy)", opacity=lulc_opacity)
     add_onmap_legend(m, make_lulc_legend_png(), position=next_pos())
 
 folium.LayerControl(collapsed=False).add_to(m)

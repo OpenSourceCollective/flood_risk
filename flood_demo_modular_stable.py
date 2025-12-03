@@ -58,7 +58,7 @@ def run(summary_path, w_dist, w_drainage, w_soil, w_lulc, out_path_override=None
         dist = src.read(1); transform = src.transform; crs = src.crs
     with rasterio.open(p["drainage_density_km_per_km2"]) as src: dd = src.read(1)
     with rasterio.open(p["soil_sand_pct"]) as src: soil = src.read(1)
-    with rasterio.open(p["lulc_osm_proxy"]) as src: lulc = src.read(1)
+    with rasterio.open(p["lulc_worldcover_proxy"]) as src: lulc = src.read(1)
 
     weights = {"dist": w_dist, "drainage": w_drainage, "soil": w_soil, "lulc": w_lulc}
     risk01 = compute_risk(dist, dd, soil, lulc, weights)

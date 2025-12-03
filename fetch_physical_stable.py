@@ -1,34 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-fetch_prepare_lagos_data_fixB_worldcover.py
-Fetch and prepare realistic layers for Lagos (no index computation), using
-ESA WorldCover 10 m (2020/2021) as the LULC base and reclassifying to the
-project's 1..6 scheme (1 water, 2 built, 3 vegetation, 4 agriculture, 5 wetland, 6 other).
-If ESA WorldCover tiles are not found for the bbox/year on Planetary Computer,
-the code transparently falls back to Impact Observatory 10 m Annual LULC (v02, 2017–2023).
+fetch_prepare_lagos_data.py
+Fetch and prepare realistic layers for Lagos (no index computation).
 
 Outputs (GeoTIFFs in ./data/rasters):
   - dist_to_river_m.tif
-  - lulc_worldcover_proxy.tif  (or io_lulc_proxy.tif if fallback)
+  - lulc_osm_proxy.tif
   - drainage_density_km_per_km2.tif
   - soil_sand_pct.tif
 And a summary JSON at data/rasters/prepared_layers_summary.json
 
 Run:
-  pip install geopandas shapely rasterio osmnx requests numpy scipy pyproj rtree pystac-client planetary-computer
-  python fetch_prepare_lagos_data_fixB_worldcover.py --place "Lagos, Nigeria"
+  pip install geopandas shapely rasterio osmnx requests numpy scipy pyproj rtree
+  python fetch_prepare_lagos_data.py
 """
-import os, sys, math, json, warnings, argparse
+import os, sys, math, json, warnings
 from dataclasses import dataclass
-from typing import Tuple, List
+import argparse
+from typing import Tuple
 import numpy as np
 import geopandas as gpd
 import rasterio
 from rasterio.features import rasterize
 from rasterio.transform import from_origin
 from rasterio.enums import Resampling
-from rasterio.merge import merge
 from shapely.geometry import box
 from pyproj import CRS
 import requests
@@ -47,14 +43,13 @@ warnings.filterwarnings("ignore", category=UserWarning)
 @dataclass
 class Config:
     place_name: str = "Lagos, Nigeria"
-    grid_res_deg: float = 0.001         # ~111 m target grid (WorldCover will be resampled)
-    fishnet_cell_deg: float = 0.01      # ~1.1 km
+    grid_res_deg: float = 0.001         # ≈ 111 m
+    fishnet_cell_deg: float = 0.01      # ≈ 1.1 km
     soil_res_m: int = 250
     buffer_deg: float = 0.02
     out_dir: str = "data/rasters"
     tmp_dir: str = "data/tmp"
     crs_epsg: int = 4326
-    worldcover_year: int = 2021
 
 CFG = Config()
 
@@ -71,8 +66,7 @@ def geocode_aoi(place: str) -> gpd.GeoDataFrame:
 
 def bbox_from_gdf(gdf: gpd.GeoDataFrame, buffer_deg: float = 0.02):
     minx, miny, maxx, maxy = gdf.total_bounds
-    return (float(minx - buffer_deg), float(miny - buffer_deg),
-            float(maxx + buffer_deg), float(maxy + buffer_deg))
+    return (minx - buffer_deg, miny - buffer_deg, maxx + buffer_deg, maxy + buffer_deg)
 
 def make_raster_grid(bbox, res_deg):
     west, south, east, north = bbox
@@ -100,12 +94,43 @@ def rasterize_geoms(geoms, out_shape, transform, burn_value=1, all_touched=False
                     fill=0, all_touched=all_touched, dtype=dtype)
     return out
 
-# ------------- OSM waterways for distance & drainage -------------
+# ------------- OSM fetchers & processors -------------
 def fetch_osm_waterways(bbox):
     if ox is None:
         raise RuntimeError("osmnx is required (pip install osmnx).")
     west, south, east, north = bbox
     tags = {"waterway": ["river", "stream", "canal", "drain"]}
+    g = None
+    # Try v2
+    try:
+        from osmnx import features as _ox_features
+        g = _ox_features.features_from_bbox(north, south, east, west, tags=tags)
+    except Exception:
+        pass
+    # v1 fallback
+    if g is None:
+        try:
+            g = ox.geometries_from_bbox(north, south, east, west, tags=tags)
+        except Exception:
+            g = None
+    # polygon fallback
+    if g is None or g.empty:
+        aoi = geocode_aoi(CFG.place_name)
+        poly = aoi.unary_union
+        try:
+            from osmnx import features as _ox_features
+            g = _ox_features.features_from_polygon(poly, tags=tags)
+        except Exception:
+            g = ox.geometries_from_polygon(poly, tags=tags)
+    g = g[g.geometry.geom_type.isin(["LineString","MultiLineString"])].copy().to_crs(epsg=CFG.crs_epsg)
+    g["length_m"] = g.to_crs(epsg=3857).geometry.length
+    return g
+
+def fetch_osm_lulc_polys(bbox):
+    if ox is None:
+        raise RuntimeError("osmnx is required (pip install osmnx).")
+    west, south, east, north = bbox
+    tags = {"landuse": True, "natural": True, "water": True, "building": True}
     g = None
     try:
         from osmnx import features as _ox_features
@@ -125,9 +150,33 @@ def fetch_osm_waterways(bbox):
             g = _ox_features.features_from_polygon(poly, tags=tags)
         except Exception:
             g = ox.geometries_from_polygon(poly, tags=tags)
-    g = g[g.geometry.geom_type.isin(["LineString","MultiLineString"])].copy().to_crs(epsg=CFG.crs_epsg)
-    g["length_m"] = g.to_crs(epsg=3857).geometry.length
+    g = g[g.geometry.geom_type.isin(["Polygon","MultiPolygon"])].copy().to_crs(epsg=CFG.crs_epsg)
     return g
+
+def lulc_class_from_osm(row) -> int:
+    low = (lambda x: str(x).lower() if x is not None else "")
+    landuse = low(row.get("landuse")); natural = low(row.get("natural"))
+    water = low(row.get("water")); building = low(row.get("building"))
+    if water in ("reservoir","pond","lake") or natural in ("water","wetland"):
+        return 1
+    if building and building != "nan": return 2
+    if landuse in ("residential","industrial","commercial","retail"): return 2
+    if landuse in ("farmland","orchard","vineyard","meadow","grass"): return 4
+    if natural in ("wood","forest","grassland","scrub"): return 3
+    if natural == "wetland": return 5
+    return 6
+
+def build_lulc_raster(polys, transform, out_shape):
+    if "lulc_class" not in polys.columns:
+        polys = polys.copy(); polys["lulc_class"] = polys.apply(lulc_class_from_osm, axis=1)
+    priority = [1,2,5,3,4,6]
+    out = np.zeros(out_shape, dtype="uint8")
+    for cls in priority:
+        geoms = polys.loc[polys["lulc_class"]==cls, "geometry"].values
+        if len(geoms)==0: continue
+        mask = rasterize_geoms(geoms, out_shape, transform, burn_value=cls, all_touched=True, dtype="uint8")
+        out = np.where(mask!=0, mask, out)
+    return out
 
 def compute_distance_to_river_raster(waterways, transform, out_shape):
     if distance_transform_edt is None:
@@ -207,182 +256,28 @@ def download_soilgrids_bbox(bbox, out_tif, coverage="sand_0-5cm_Q0.5", res_m=250
         raise RuntimeError(f"SoilGrids did not return a GeoTIFF. See debug: {dbg}")
     print(f"[SoilGrids] Saved: {out_tif}")
 
-# ---------------- WorldCover via STAC (Planetary Computer) ----------------
-def _pc_client():
-    from pystac_client import Client
-    import planetary_computer as pc
-    return Client.open("https://planetarycomputer.microsoft.com/api/stac/v1", modifier=pc.sign_inplace)
-
-def fetch_worldcover_items(bbox, year=2021):
-    """
-    Robust search for ESA WorldCover tiles.
-    1) Try datetime range filter for the target year.
-    2) If empty, try without datetime.
-    Returns list of rasterio datasets (opened).
-    """
-    client = _pc_client()
-    # 1) datetime range for the year
-    dt = f"{int(year)}-01-01/{int(year)}-12-31"
-    search = client.search(collections=["esa-worldcover"], bbox=list(map(float, bbox)), datetime=dt)
-    items = list(search.get_items())
-    if not items:
-        # 2) try without datetime (grab whatever version is indexed)
-        search = client.search(collections=["esa-worldcover"], bbox=list(map(float, bbox)))
-        items = list(search.get_items())
-    srcs = []
-    for it in items:
-        assets = it.assets
-        key = next((k for k in assets.keys() if "map" in k.lower()), None)
-        if key is None:
-            continue
-        href = assets[key].href  # already signed via client modifier
-        srcs.append(rasterio.open(href))
-    return srcs
-
-def fetch_io_lulc_items(bbox, year=2021):
-    """
-    Fallback: Impact Observatory 10m Annual LULC v02 (2017–2023).
-    Returns list of rasterio datasets (opened).
-    """
-    client = _pc_client()
-    dt = f"{int(year)}-01-01/{int(year)}-12-31"
-    # Newer annual collection id
-    collections = ["io-lulc-annual-v02", "io-lulc-annual"]
-    items = []
-    for coll in collections:
-        try:
-            search = client.search(collections=[coll], bbox=list(map(float, bbox)), datetime=dt)
-            items = list(search.get_items())
-            if items:
-                break
-        except Exception:
-            continue
-    srcs = []
-    for it in items:
-        assets = it.assets
-        # asset key is typically 'data'
-        key = "data" if "data" in assets else next(iter(assets.keys()))
-        href = assets[key].href
-        srcs.append(rasterio.open(href))
-    return srcs
-
-def reclassify_worldcover_to_proxy(wc_arr):
-    """
-    Map ESA WorldCover classes to project 1..6:
-      water(80)->1
-      built(50)->2
-      wetlands(90,95)->5
-      vegetation (10,20,30)->3
-      agriculture cropland(40)->4
-      other (60,70,100,0) ->6
-    """
-    out = np.full_like(wc_arr, 6, dtype=np.uint8)
-    out[(wc_arr==80)] = 1
-    out[(wc_arr==50)] = 2
-    out[(wc_arr==90) | (wc_arr==95)] = 5
-    out[(wc_arr==10) | (wc_arr==20) | (wc_arr==30)] = 3
-    out[(wc_arr==40)] = 4
-    return out
-
-def reclassify_io_to_proxy(io_arr):
-    """
-    Map Impact Observatory 10m 9-class (0..8) to project 1..6:
-      0 Water -> 1
-      6 Built area -> 2
-      1 Trees, 2 Grass, 5 Shrub/Scrub -> 3
-      4 Crops -> 4
-      3 Flooded vegetation -> 5
-      7 Bare ground, 8 Snow/Ice -> 6
-    """
-    out = np.full_like(io_arr, 6, dtype=np.uint8)
-    out[(io_arr==0)] = 1
-    out[(io_arr==6)] = 2
-    out[(io_arr==1) | (io_arr==2) | (io_arr==5)] = 3
-    out[(io_arr==4)] = 4
-    out[(io_arr==3)] = 5
-    out[(io_arr==7) | (io_arr==8)] = 6
-    return out
-
-def fetch_worldcover_or_io_to_grid(bbox, target_transform, target_shape, out_path_wc, out_path_io, year=2021):
-    # Try WorldCover first
-    srcs = fetch_worldcover_items(bbox, year=year)
-    label = None
-    if not srcs:
-        # Fallback to IO annual
-        srcs = fetch_io_lulc_items(bbox, year=year)
-        label = "io"
-    if not srcs:
-        raise RuntimeError("No LULC tiles found from Planetary Computer for the given bbox/year (tried WorldCover then IO Annual).")
-    mosaic, mosaic_transform = merge(srcs)
-    for s in srcs: s.close()
-    arr = mosaic[0]
-
-    # Reproject/resample to target grid (nearest for categorical)
-    import rasterio.warp
-    tmp_reproj = os.path.join(CFG.tmp_dir, "lulc_reproj.tif")
-    profile = {
-        "driver":"GTiff","height":target_shape[0],"width":target_shape[1],
-        "count":1,"dtype":arr.dtype.name,"crs":"EPSG:4326","transform":target_transform,
-        "compress":"deflate","nodata":0
-    }
-    with rasterio.open(tmp_reproj, "w", **profile) as dst:
-        rasterio.warp.reproject(
-            source=arr,
-            destination=rasterio.band(dst, 1),
-            src_transform=mosaic_transform,
-            src_crs="EPSG:4326",
-            dst_transform=target_transform,
-            dst_crs="EPSG:4326",
-            resampling=rasterio.warp.Resampling.nearest
-        )
-    with rasterio.open(tmp_reproj) as src:
-        data = src.read(1)
-
-    if label == "io":
-        proxy = reclassify_io_to_proxy(data)
-        out_path = out_path_io
-    else:
-        proxy = reclassify_worldcover_to_proxy(data)
-        out_path = out_path_wc
-
-    crs = CRS.from_epsg(CFG.crs_epsg)
-    save_geotiff(out_path, proxy, target_transform, crs, nodata=0, dtype="uint8")
-    return out_path, ("IO Annual v02" if label=="io" else "ESA WorldCover")
-
-def resample_to_grid(src_path, target_transform, target_shape, out_path, resampling=Resampling.nearest, src_nodata=0, dst_nodata=0):
-    import rasterio.warp
+def resample_to_grid(src_path, target_transform, target_shape, out_path, resampling=Resampling.bilinear):
     with rasterio.open(src_path) as src:
-        profile = {
-            "driver":"GTiff","height":target_shape[0],"width":target_shape[1],
-            "count":1,"dtype":src.dtypes[0],"crs":"EPSG:4326","transform":target_transform,
-            "compress":"deflate","nodata":dst_nodata
-        }
-        with rasterio.open(out_path, "w", **profile) as dst:
-            rasterio.warp.reproject(
-                source=rasterio.band(src, 1),
-                destination=rasterio.band(dst, 1),
-                src_transform=src.transform,
-                src_crs=src.crs,
-                src_nodata=src_nodata,
-                dst_transform=target_transform,
-                dst_crs="EPSG:4326",
-                dst_nodata=dst_nodata,
-                resampling=resampling
-            )
+        data = src.read(out_shape=(1, target_shape[0], target_shape[1]), resampling=resampling)
+        out_meta = src.meta.copy()
+        out_meta.update({"height": target_shape[0], "width": target_shape[1],
+                         "transform": target_transform, "crs": src.crs})
+        with rasterio.open(out_path, "w", **out_meta) as dst:
+            dst.write(data)
 
-# ---------------------------- Main ----------------------------
+
 def parse_args():
-    ap = argparse.ArgumentParser(description="Fetch & prepare Lagos-like layers with ESA WorldCover LULC (with IO fallback)")
+    ap = argparse.ArgumentParser(description="Fetch & prepare Lagos-like layers for any AOI")
     ap.add_argument("--place", default="Lagos, Nigeria", help="AOI place name for geocoding (Nominatim)")
-    ap.add_argument("--grid-res-deg", type=float, default=0.001, help="Target grid resolution in degrees (~0.001 ≈ 111 m)")
+    ap.add_argument("--grid-res-deg", type=float, default=0.001, help="Grid resolution in degrees (~0.001 ≈ 111 m)")
     ap.add_argument("--fishnet-deg", type=float, default=0.01, help="Fishnet cell size in degrees for drainage density")
     ap.add_argument("--soil-res-m", type=int, default=250, help="SoilGrids requested resolution in meters")
     ap.add_argument("--buffer-deg", type=float, default=0.02, help="Buffer to expand AOI bbox in degrees")
     ap.add_argument("--out-dir", default="data/rasters", help="Output rasters directory")
     ap.add_argument("--tmp-dir", default="data/tmp", help="Temporary directory")
-    ap.add_argument("--worldcover-year", type=int, default=2021, help="Year to request (WorldCover or IO Annual)")
     return ap.parse_args()
 
+# ---------------------------- Main ----------------------------
 def main():
     args = parse_args()
     # Override CFG with CLI
@@ -393,9 +288,8 @@ def main():
     CFG.buffer_deg = args.buffer_deg
     CFG.out_dir = args.out_dir
     CFG.tmp_dir = args.tmp_dir
-    CFG.worldcover_year = args.worldcover_year
     ensure_dirs()
-    print("=== Fetch & Prepare Layers (WorldCover LULC with IO fallback) ===")
+    print("=== Fetch & Prepare Layers (no index) ===")
     print(f"AOI: {CFG.place_name}")
     aoi = geocode_aoi(CFG.place_name)
     bbox = bbox_from_gdf(aoi, buffer_deg=CFG.buffer_deg)
@@ -403,7 +297,6 @@ def main():
     transform, out_shape = make_raster_grid(bbox, CFG.grid_res_deg)
     crs = CRS.from_epsg(CFG.crs_epsg)
 
-    # waterways for distance & drainage
     print("Fetching OSM waterways ...")
     waterways = fetch_osm_waterways(bbox)
     print(f"Waterway lines: {len(waterways)}")
@@ -413,86 +306,46 @@ def main():
     dist_river_path = os.path.join(CFG.out_dir, "dist_to_river_m.tif")
     save_geotiff(dist_river_path, dist_river, transform, crs, nodata=np.nan, dtype="float32")
 
+    print("Fetching OSM LULC polygons ...")
+    lulc_polys = fetch_osm_lulc_polys(bbox)
+    print(f"LULC polys: {len(lulc_polys)}")
+    print("Rasterizing LULC classes ...")
+    lulc_arr = build_lulc_raster(lulc_polys, transform, out_shape)
+    lulc_path = os.path.join(CFG.out_dir, "lulc_osm_proxy.tif")
+    save_geotiff(lulc_path, lulc_arr, transform, crs, nodata=0, dtype="uint8")
+
     print("Computing drainage density (km/km²) ...")
     dd_grid = compute_drainage_density_grid(waterways, bbox, CFG.fishnet_cell_deg)
     dd_raster = rasterize_grid_values(dd_grid, "dd_km_per_km2", transform, out_shape)
     dd_path = os.path.join(CFG.out_dir, "drainage_density_km_per_km2.tif")
     save_geotiff(dd_path, dd_raster, transform, crs, nodata=0.0, dtype="float32")
 
-    # LULC (WorldCover then IO fallback)
-    wc_out = os.path.join(CFG.out_dir, "lulc_worldcover_proxy.tif")
-    io_out = os.path.join(CFG.out_dir, "lulc_io_annual_proxy.tif")
-    print(f"Searching Planetary Computer for LULC tiles in {CFG.worldcover_year} …")
-    out_path, provider = fetch_worldcover_or_io_to_grid(bbox, transform, out_shape, wc_out, io_out, year=CFG.worldcover_year)
-    print(f"Using provider: {provider}; wrote {out_path}")
-
     print("Downloading SoilGrids sand fraction (0–5 cm, Q0.5) ...")
     soil_raw = os.path.join(CFG.tmp_dir, "soil_sand_raw.tif")
     download_soilgrids_bbox(bbox, soil_raw, coverage="sand_0-5cm_Q0.5", res_m=CFG.soil_res_m)
     print("Resampling soil layer to target grid ...")
     soil_path = os.path.join(CFG.out_dir, "soil_sand_pct.tif")
-    import rasterio.warp
-    with rasterio.open(soil_raw) as src:
-        profile = {
-            "driver":"GTiff","height":out_shape[0],"width":out_shape[1],
-            "count":1,"dtype":src.dtypes[0],"crs":"EPSG:4326","transform":transform,
-            "compress":"deflate","nodata":None
-        }
-        with rasterio.open(soil_path, "w", **profile) as dst:
-            rasterio.warp.reproject(
-                source=rasterio.band(src,1), destination=rasterio.band(dst,1),
-                src_transform=src.transform, src_crs=src.crs,
-                dst_transform=transform, dst_crs="EPSG:4326",
-                resampling=rasterio.warp.Resampling.bilinear
-            )
+    resample_to_grid(soil_raw, transform, out_shape, soil_path, resampling=Resampling.bilinear)
 
-    # Summary
-    # summary = {
-    #     "aoi_place": CFG.place_name,
-    #     "bbox": bbox,
-    #     "grid_res_deg": CFG.grid_res_deg,
-    #     "fishnet_cell_deg": CFG.fishnet_cell_deg,
-    #     "soil_res_m": CFG.soil_res_m,
-    #     "worldcover_year": CFG.worldcover_year,
-    #     "lulc_provider": provider,
-    #     "outputs": {
-    #         "dist_to_river_m": dist_river_path,
-    #         "lulc_proxy": out_path,
-    #         "drainage_density_km_per_km2": dd_path,
-    #         "soil_sand_pct": soil_path
-    #     }
-    # }
-    # summary_path = os.path.join(CFG.out_dir, "prepared_layers_summary.json")
-    # with open(summary_path, "w") as f:
-    #     json.dump(summary, f, indent=2)
-    # print(f"Wrote summary: {summary_path}")
-    # print("=== Done (WorldCover/IO) ===")
-
-    # Summary (with backward-compatible keys)
-    outputs = {
-        "dist_to_river_m": dist_river_path,
-        "drainage_density_km_per_km2": dd_path,
-        "soil_sand_pct": soil_path,
-        "lulc_proxy": out_path,   # new generic key
-        "lulc": out_path          # super-generic alias if you want
-    }
-    if provider == "ESA WorldCover":
-        outputs["lulc_worldcover_proxy"] = out_path
-    else:
-        outputs["lulc_io_annual_proxy"] = out_path
+    # Summary (no risk here)
     summary = {
         "aoi_place": CFG.place_name,
         "bbox": bbox,
         "grid_res_deg": CFG.grid_res_deg,
         "fishnet_cell_deg": CFG.fishnet_cell_deg,
         "soil_res_m": CFG.soil_res_m,
-        "worldcover_year": CFG.worldcover_year,
-        "lulc_provider": provider,
-        "outputs": outputs
+        "outputs": {
+            "dist_to_river_m": dist_river_path,
+            "lulc_osm_proxy": lulc_path,
+            "drainage_density_km_per_km2": dd_path,
+            "soil_sand_pct": soil_path
+        }
     }
     summary_path = os.path.join(CFG.out_dir, "prepared_layers_summary.json")
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
+    print(f"Wrote summary (no risk): {summary_path}")
+    print("=== Done (fetch/prepare) ===")
 
 if __name__ == "__main__":
     try:

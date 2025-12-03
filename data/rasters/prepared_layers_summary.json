@@ -9,11 +9,15 @@
   "grid_res_deg": 0.001,
   "fishnet_cell_deg": 0.01,
   "soil_res_m": 250,
+  "worldcover_year": 2021,
+  "lulc_provider": "ESA WorldCover",
   "outputs": {
     "dist_to_river_m": "data/rasters/dist_to_river_m.tif",
-    "lulc_osm_proxy": "data/rasters/lulc_osm_proxy.tif",
     "drainage_density_km_per_km2": "data/rasters/drainage_density_km_per_km2.tif",
     "soil_sand_pct": "data/rasters/soil_sand_pct.tif",
+    "lulc_proxy": "data/rasters/lulc_worldcover_proxy.tif",
+    "lulc": "data/rasters/lulc_worldcover_proxy.tif",
+    "lulc_worldcover_proxy": "data/rasters/lulc_worldcover_proxy.tif",
     "flood_risk_0to1": "data/rasters/flood_risk_0to1.tif"
   }
 }
