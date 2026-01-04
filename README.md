@@ -13,11 +13,10 @@
 - chmod +x setup.sh
 - ./setup.sh
 - source venv/bin/activate
-- python3 fetch_metrology.py --start 2023-01-01 --end 2024-12-31 (to get metrology data)
-- python fetch_physical.py (to get physical data) 
-- python3 flood_demo_modular_Stable.py (to run flood estimation pipeline and get output rasters)
-- streamlit run streamlit_flood_viewer.py
-
+- python3 fetch_meterology.py --start 2023-01-01 --end 2024-12-31 (optional run to fetch metrology data)
+- python3 fetch_physical.py (to fetch needed data and create rasters. takes a little while to finish executing)
+- python3 flood_demo_modular_Stable.py (to compute flood risk using created rasters)
+- streamlit run streamlit_flood_viewer.py (to visualize results)
 
 
 # ▶️ Basic Usage

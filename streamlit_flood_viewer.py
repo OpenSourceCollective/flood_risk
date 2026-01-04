@@ -14,6 +14,7 @@ from PIL import Image, ImageDraw
 import streamlit as st
 from streamlit_folium import st_folium
 import folium
+from flood_demo_modular_stable import run as recompute_flood_risk
 from branca.element import Element
 
 st.set_page_config(page_title="Flood Risk Viewer", layout="wide")
@@ -146,25 +147,54 @@ CMAPS = {
     "lulc_worldcover_proxy": "tab10",
 }
 
-# Toggles + opacity
+# Controls: toggles + WEIGHTS (replaces per-layer opacity sliders)
+st.sidebar.subheader("Flood index weights (used to recompute flood_risk_0to1)")
+normalize_weights = st.sidebar.checkbox("Normalize weights to sum to 1", value=True, key="normalize_weights")
+
+# defaults: prefer weights stored in summary, else fall back
+w_defaults = {"dist": 0.35, "drainage": 0.25, "soil": 0.20, "lulc": 0.20}
+w_used = meta.get("flood_risk_weights_used", {})
+for k in w_defaults:
+    if k in w_used:
+        try:
+            w_defaults[k] = float(w_used[k])
+        except Exception:
+            pass
+
+w_dist = st.sidebar.slider("Weight: distance to waterways", 0.0, 1.0, float(w_defaults["dist"]), 0.01, key="w_dist")
+w_dd   = st.sidebar.slider("Weight: drainage density",      0.0, 1.0, float(w_defaults["drainage"]), 0.01, key="w_dd")
+w_soil = st.sidebar.slider("Weight: soil infiltration",     0.0, 1.0, float(w_defaults["soil"]), 0.01, key="w_soil")
+w_lulc = st.sidebar.slider("Weight: land cover (LULC)",      0.0, 1.0, float(w_defaults["lulc"]), 0.01, key="w_lulc")
+
+if st.sidebar.button("Recompute flood_risk_0to1.tif", key="btn_recompute"):
+    try:
+        out_path, w_final = recompute_flood_risk(
+            summary_path=summary_path,
+            w_dist=w_dist, w_drainage=w_dd, w_soil=w_soil, w_lulc=w_lulc,
+            out_path_override=None,
+            normalize_weights=normalize_weights,
+        )
+        st.sidebar.success(f"Recomputed: {out_path}")
+        st.sidebar.json({"weights_used": w_final})
+        # reload meta/paths after recompute
+        meta = read_summary(summary_path)
+        paths = meta["outputs"]
+    except Exception as e:
+        st.sidebar.error("Failed to recompute flood risk")
+        st.sidebar.exception(e)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Display settings")
+overlay_opacity = st.sidebar.slider("Overlay opacity (visual only)", 0.0, 1.0, 0.65, 0.05, key="overlay_opacity")
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Layers to display")
 show_risk = st.sidebar.checkbox("Flood risk (0–1)", value=True, key="toggle_risk")
-risk_opacity = st.sidebar.slider("Risk opacity", 0.0, 1.0, 0.75, 0.05, key="opacity_risk")
-
-st.sidebar.markdown("---")
 show_dist = st.sidebar.checkbox("Distance to river (m)", value=False, key="toggle_dist")
-dist_opacity = st.sidebar.slider("Distance opacity", 0.0, 1.0, 0.6, 0.05, key="opacity_dist")
-
-st.sidebar.markdown("---")
 show_dd = st.sidebar.checkbox("Drainage density (km/km²)", value=False, key="toggle_dd")
-dd_opacity = st.sidebar.slider("Drainage density opacity", 0.0, 1.0, 0.6, 0.05, key="opacity_dd")
-
-st.sidebar.markdown("---")
 show_soil = st.sidebar.checkbox("Soil sand fraction (%)", value=False, key="toggle_soil")
-soil_opacity = st.sidebar.slider("Soil sand opacity", 0.0, 1.0, 0.6, 0.05, key="opacity_soil")
-
-st.sidebar.markdown("---")
 show_lulc = st.sidebar.checkbox("LULC (worldcover proxy)", value=False, key="toggle_lulc")
-lulc_opacity = st.sidebar.slider("LULC opacity", 0.0, 1.0, 0.6, 0.05, key="opacity_lulc")
+
 
 # --------------- Map Build ----------------
 
@@ -187,31 +217,31 @@ def next_pos():
 if show_risk and "flood_risk_0to1" in paths and os.path.exists(paths["flood_risk_0to1"]):
     p = paths["flood_risk_0to1"]
     img, (rvmin, rvmax) = raster_to_rgba_image(p, cmap_name=CMAPS["flood_risk_0to1"])
-    add_image_overlay(m, img, raster_bounds_latlon(p), "Flood risk (0–1)", opacity=risk_opacity)
+    add_image_overlay(m, img, raster_bounds_latlon(p), "Flood risk (0–1)", opacity=overlay_opacity)
     add_onmap_legend(m, make_continuous_legend_png(CMAPS["flood_risk_0to1"], rvmin, rvmax, "Flood risk (0–1)"), position=next_pos())
 
 if show_dist and "dist_to_river_m" in paths and os.path.exists(paths["dist_to_river_m"]):
     p = paths["dist_to_river_m"]
     img, (dvmin, dvmax) = raster_to_rgba_image(p, cmap_name=CMAPS["dist_to_river_m"])
-    add_image_overlay(m, img, raster_bounds_latlon(p), "Distance to river (m)", opacity=dist_opacity)
+    add_image_overlay(m, img, raster_bounds_latlon(p), "Distance to river (m)", opacity=overlay_opacity)
     add_onmap_legend(m, make_continuous_legend_png(CMAPS["dist_to_river_m"], dvmin, dvmax, "Distance to river (m)"), position=next_pos())
 
 if show_dd and "drainage_density_km_per_km2" in paths and os.path.exists(paths["drainage_density_km_per_km2"]):
     p = paths["drainage_density_km_per_km2"]
     img, (ddvmin, ddvmax) = raster_to_rgba_image(p, cmap_name=CMAPS["drainage_density_km_per_km2"])
-    add_image_overlay(m, img, raster_bounds_latlon(p), "Drainage density (km/km²)", opacity=dd_opacity)
+    add_image_overlay(m, img, raster_bounds_latlon(p), "Drainage density (km/km²)", opacity=overlay_opacity)
     add_onmap_legend(m, make_continuous_legend_png(CMAPS["drainage_density_km_per_km2"], ddvmin, ddvmax, "Drainage density (km/km²)"), position=next_pos())
 
 if show_soil and "soil_sand_pct" in paths and os.path.exists(paths["soil_sand_pct"]):
     p = paths["soil_sand_pct"]
     img, (svmin, svmax) = raster_to_rgba_image(p, cmap_name=CMAPS["soil_sand_pct"])
-    add_image_overlay(m, img, raster_bounds_latlon(p), "Soil sand fraction (%)", opacity=soil_opacity)
+    add_image_overlay(m, img, raster_bounds_latlon(p), "Soil sand fraction (%)", opacity=overlay_opacity)
     add_onmap_legend(m, make_continuous_legend_png(CMAPS["soil_sand_pct"], svmin, svmax, "Soil sand fraction (%)"), position=next_pos())
 
 if show_lulc and "lulc_worldcover_proxy" in paths and os.path.exists(paths["lulc_worldcover_proxy"]):
     p = paths["lulc_worldcover_proxy"]
     img, _ = raster_to_rgba_image(p, cmap_name=CMAPS["lulc_worldcover_proxy"])
-    add_image_overlay(m, img, raster_bounds_latlon(p), "LULC (worldcover proxy)", opacity=lulc_opacity)
+    add_image_overlay(m, img, raster_bounds_latlon(p), "LULC (worldcover proxy)", opacity=overlay_opacity)
     add_onmap_legend(m, make_lulc_legend_png(), position=next_pos())
 
 folium.LayerControl(collapsed=False).add_to(m)
