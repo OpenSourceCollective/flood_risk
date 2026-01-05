@@ -7,17 +7,29 @@
     6.7167964
   ],
   "grid_res_deg": 0.001,
-  "fishnet_cell_deg": 0.01,
+  "fishnet_cell_deg": 0.005,
+  "smooth_drainage_sigma": 1.25,
   "soil_res_m": 250,
-  "worldcover_year": 2021,
+  "worldcover_year": 2024,
   "lulc_provider": "ESA WorldCover",
   "outputs": {
     "dist_to_river_m": "data/rasters/dist_to_river_m.tif",
     "drainage_density_km_per_km2": "data/rasters/drainage_density_km_per_km2.tif",
     "soil_sand_pct": "data/rasters/soil_sand_pct.tif",
-    "lulc_proxy": "data/rasters/lulc_worldcover_proxy.tif",
     "lulc": "data/rasters/lulc_worldcover_proxy.tif",
+    "lulc_proxy": "data/rasters/lulc_worldcover_proxy.tif",
     "lulc_worldcover_proxy": "data/rasters/lulc_worldcover_proxy.tif",
     "flood_risk_0to1": "data/rasters/flood_risk_0to1.tif"
-  }
+  },
+  "notes": {
+    "dist_to_river_m": "Improved: distance to union(OSM waterways + inland water polygons).",
+    "drainage_density_km_per_km2": "Improved: smaller fishnet + optional Gaussian smoothing."
+  },
+  "flood_risk_weights_used": {
+    "dist": 0.35,
+    "drainage": 0.25,
+    "soil": 0.2,
+    "lulc": 0.2
+  },
+  "lulc_key_used": "lulc_worldcover_proxy"
 }
