@@ -217,6 +217,53 @@ def save_geotiff(path, array, transform, crs, nodata=None, dtype=None, compress=
     with safe_rio_open(path, "w", **profile) as dst:
         dst.write(array.astype(dtype), 1)
 
+def mask_raster_to_boundary(array, transform, crs, boundary_geom, nodata=None):
+    """
+    Mask a raster array to a boundary polygon (e.g., city boundary).
+    Pixels outside the boundary are set to nodata.
+    
+    Args:
+        array: numpy array (2D raster data)
+        transform: rasterio transform
+        crs: CRS object
+        boundary_geom: shapely geometry (boundary polygon)
+        nodata: value to use for masked pixels (default: 0 for uint8, NaN for float)
+    
+    Returns:
+        masked_array: array with pixels outside boundary set to nodata
+    """
+    from rasterio.mask import mask as rasterio_mask
+    from rasterio.io import MemoryFile
+    
+    # Determine nodata value if not provided
+    if nodata is None:
+        if np.issubdtype(array.dtype, np.floating):
+            nodata = np.nan
+        else:
+            nodata = 0
+    
+    # Create a temporary in-memory raster
+    profile = {
+        "driver": "GTiff",
+        "height": array.shape[0],
+        "width": array.shape[1],
+        "count": 1,
+        "dtype": array.dtype,
+        "crs": crs,
+        "transform": transform,
+        "nodata": nodata,
+    }
+    
+    # Write array to memory and immediately mask
+    with MemoryFile() as memfile:
+        with memfile.open(**profile) as mem_src:
+            mem_src.write(array, 1)
+        
+        # Mask using the boundary geometry
+        with memfile.open() as mem_src:
+            masked_array, _ = rasterio_mask(mem_src, [boundary_geom], crop=False, nodata=nodata)
+            return masked_array[0]
+
 def rasterize_geoms(geoms, out_shape, transform, burn_value=1, all_touched=False, dtype="uint8"):
     if len(geoms) == 0:
         return np.zeros(out_shape, dtype=dtype)
@@ -424,7 +471,7 @@ def reclassify_io_to_proxy(io_arr):
     out[(io_arr == 7) | (io_arr == 8)] = 6
     return out
 
-def fetch_worldcover_or_io_to_grid(bbox, target_transform, target_shape, out_path_wc, out_path_io, year=2024):
+def fetch_worldcover_or_io_to_grid(bbox, target_transform, target_shape, out_path_wc, out_path_io, year=2024, boundary_geom=None, crs=None):
     srcs = fetch_worldcover_items(bbox, year=year)
     label = None
     if not srcs:
@@ -474,6 +521,10 @@ def fetch_worldcover_or_io_to_grid(bbox, target_transform, target_shape, out_pat
         out_path = out_path_wc
         provider = "ESA WorldCover"
 
+    # Apply boundary masking if provided
+    if boundary_geom is not None and crs is not None:
+        proxy = mask_raster_to_boundary(proxy, target_transform, crs, boundary_geom, nodata=0)
+
     save_geotiff(out_path, proxy, target_transform, CRS.from_epsg(4326), nodata=0, dtype="uint8")
     return out_path, provider
 
@@ -487,6 +538,22 @@ def parse_args():
     ap.add_argument("--smooth-sigma", type=float, default=CFG.smooth_drainage_sigma)
     ap.add_argument("--worldcover-year", type=int, default=CFG.worldcover_year)
     return ap.parse_args()
+
+def load_city_boundary():
+    """Load city boundary from GeoJSON file."""
+    boundary_path = "data/city_boundary.geojson"
+    if not os.path.exists(boundary_path):
+        print(f"[WARNING] City boundary not found at {boundary_path}. Skipping masking.")
+        return None
+    
+    boundary_gdf = gpd.read_file(boundary_path)
+    if boundary_gdf.empty:
+        print("[WARNING] City boundary GeoJSON is empty. Skipping masking.")
+        return None
+    
+    boundary_geom = boundary_gdf.geometry.iloc[0]
+    print(f"Loaded city boundary from {boundary_path}")
+    return boundary_geom
 
 def main():
     args = parse_args()
@@ -506,23 +573,30 @@ def main():
     bbox = bbox_from_gdf(aoi, buffer_deg=CFG.buffer_deg)
     transform, out_shape = make_raster_grid_from_bbox(bbox, CFG.grid_res_deg)
 
+    # Load city boundary for masking
+    boundary_geom = load_city_boundary()
+
     # Water features
     water_lines, water_polys = fetch_osm_waterways_and_waterpolys(bbox)
 
     dist = compute_distance_to_water_raster(water_lines, water_polys, transform, out_shape, grid_res_deg=CFG.grid_res_deg)
+    if boundary_geom is not None:
+        dist = mask_raster_to_boundary(dist, transform, crs, boundary_geom, nodata=np.nan)
     dist_path = os.path.join(CFG.out_dir, "dist_to_river_m.tif")
     save_geotiff(dist_path, dist, transform, crs, nodata=np.nan, dtype="float32")
 
     dd_grid = compute_drainage_density_grid(water_lines, bbox, CFG.fishnet_cell_deg)
     dd = rasterize_grid_values(dd_grid, "dd_km_per_km2", transform, out_shape)
     dd = smooth_raster(dd, CFG.smooth_drainage_sigma)
+    if boundary_geom is not None:
+        dd = mask_raster_to_boundary(dd, transform, crs, boundary_geom, nodata=0.0)
     dd_path = os.path.join(CFG.out_dir, "drainage_density_km_per_km2.tif")
     save_geotiff(dd_path, dd, transform, crs, nodata=0.0, dtype="float32")
 
     # LULC
     wc_out = os.path.join(CFG.out_dir, "lulc_worldcover_proxy.tif")
     io_out = os.path.join(CFG.out_dir, "lulc_io_annual_proxy.tif")
-    lulc_path, provider = fetch_worldcover_or_io_to_grid(bbox, transform, out_shape, wc_out, io_out, year=CFG.worldcover_year)
+    lulc_path, provider = fetch_worldcover_or_io_to_grid(bbox, transform, out_shape, wc_out, io_out, year=CFG.worldcover_year, boundary_geom=boundary_geom, crs=crs)
 
     # Soil
     soil_raw = os.path.join(CFG.tmp_dir, "soil_sand_raw.tif")
@@ -553,6 +627,13 @@ def main():
                 dst_crs="EPSG:4326",
                 resampling=rasterio.warp.Resampling.bilinear,
             )
+    
+    # Load soil raster and apply masking
+    if boundary_geom is not None:
+        with safe_rio_open(soil_path) as src:
+            soil_data = src.read(1)
+            soil_data = mask_raster_to_boundary(soil_data, transform, crs, boundary_geom, nodata=0.0)
+        save_geotiff(soil_path, soil_data, transform, crs, nodata=0.0, dtype="float32")
 
     outputs = {
         "dist_to_river_m": dist_path,
