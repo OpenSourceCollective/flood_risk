@@ -537,7 +537,41 @@ def parse_args():
     ap.add_argument("--soil-res-m", type=int, default=CFG.soil_res_m)
     ap.add_argument("--smooth-sigma", type=float, default=CFG.smooth_drainage_sigma)
     ap.add_argument("--worldcover-year", type=int, default=CFG.worldcover_year)
+    ap.add_argument("--use-grid-cells", action="store_true",
+                    help="Use grid_cells.geojson extent instead of geocoding the place name")
     return ap.parse_args()
+
+def load_grid_cell_extent(grid_path="data/grid_cells.geojson", buffer_deg=0.01):
+    """
+    Load grid cell extent from GeoJSON file with buffer for OSM fetching.
+    Returns bbox as (west, south, east, north).
+    
+    Args:
+        grid_path: Path to grid_cells.geojson file
+        buffer_deg: Buffer in degrees around grid bounds (default 0.01° ≈ 1.1 km at equator)
+    """
+    if not os.path.exists(grid_path):
+        print(f"[WARNING] Grid cells not found at {grid_path}. Using geocoding extent instead.")
+        return None
+    
+    grid_gdf = gpd.read_file(grid_path)
+    if grid_gdf.empty:
+        print(f"[WARNING] Grid cells GeoJSON is empty. Using geocoding extent instead.")
+        return None
+    
+    bounds = grid_gdf.geometry.total_bounds  # [west, south, east, north]
+    
+    # Apply buffer to ensure OSM queries have enough features
+    # Grid cells are 0.02°×0.02°, buffer allows fetching surrounding features
+    west, south, east, north = bounds
+    bbox = (west - buffer_deg, south - buffer_deg, east + buffer_deg, north + buffer_deg)
+    
+    print(f"Loaded grid cell extent from {grid_path}")
+    print(f"  Grid bounds: {bounds}")
+    print(f"  Buffered bbox: {bbox}")
+    print(f"  Grid width: {bounds[2] - bounds[0]:.6f}°, height: {bounds[3] - bounds[1]:.6f}°")
+    print(f"  Buffered width: {bbox[2] - bbox[0]:.6f}°, height: {bbox[3] - bbox[1]:.6f}°")
+    return bbox
 
 def load_city_boundary():
     """Load city boundary from GeoJSON file."""
@@ -569,8 +603,20 @@ def main():
     crs = CRS.from_epsg(CFG.crs_epsg)
 
     print("=== Fetch & Prepare Layers (improved) ===")
-    aoi = geocode_aoi(CFG.place_name)
-    bbox = bbox_from_gdf(aoi, buffer_deg=CFG.buffer_deg)
+    
+    # Load extent: either from grid cells or from geocoding
+    if args.use_grid_cells:
+        print("\n[INFO] Using grid cell extent (--use-grid-cells flag)")
+        bbox = load_grid_cell_extent()
+        if bbox is None:
+            print("[ERROR] Could not load grid cell extent. Falling back to geocoding.")
+            aoi = geocode_aoi(CFG.place_name)
+            bbox = bbox_from_gdf(aoi, buffer_deg=CFG.buffer_deg)
+    else:
+        print("\n[INFO] Using geocoded extent (pass --use-grid-cells to use grid cells instead)")
+        aoi = geocode_aoi(CFG.place_name)
+        bbox = bbox_from_gdf(aoi, buffer_deg=CFG.buffer_deg)
+    
     transform, out_shape = make_raster_grid_from_bbox(bbox, CFG.grid_res_deg)
 
     # Load city boundary for masking
