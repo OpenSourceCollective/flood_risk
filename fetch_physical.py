@@ -25,6 +25,7 @@ Run:
 import os, sys, math, json, warnings, argparse
 from dataclasses import dataclass
 from typing import Tuple
+from pathlib import Path
 
 import numpy as np
 import geopandas as gpd
@@ -537,41 +538,86 @@ def parse_args():
     ap.add_argument("--soil-res-m", type=int, default=CFG.soil_res_m)
     ap.add_argument("--smooth-sigma", type=float, default=CFG.smooth_drainage_sigma)
     ap.add_argument("--worldcover-year", type=int, default=CFG.worldcover_year)
-    ap.add_argument("--use-grid-cells", action="store_true",
-                    help="Use grid_cells.geojson extent instead of geocoding the place name")
+    ap.add_argument("--fetch-boundary", action="store_true",
+                    help="Fetch actual city boundary from OSM Nominatim (recommended on first run)")
     return ap.parse_args()
 
-def load_grid_cell_extent(grid_path="data/grid_cells.geojson", buffer_deg=0.01):
+def fetch_and_save_city_boundary(bbox, place_name="Lagos"):
     """
-    Load grid cell extent from GeoJSON file with buffer for OSM fetching.
-    Returns bbox as (west, south, east, north).
+    Fetch actual city/admin boundary from OSM Nominatim.
+    Save to data/city_boundary.geojson.
     
     Args:
-        grid_path: Path to grid_cells.geojson file
-        buffer_deg: Buffer in degrees around grid bounds (default 0.01° ≈ 1.1 km at equator)
+        bbox: Bounding box to search within
+        place_name: Name of place to query (e.g., "Lagos, Nigeria")
+    
+    Returns:
+        GeoDataFrame with boundary geometry
     """
-    if not os.path.exists(grid_path):
-        print(f"[WARNING] Grid cells not found at {grid_path}. Using geocoding extent instead.")
-        return None
+    import requests
+    from shapely.geometry import shape
     
-    grid_gdf = gpd.read_file(grid_path)
-    if grid_gdf.empty:
-        print(f"[WARNING] Grid cells GeoJSON is empty. Using geocoding extent instead.")
-        return None
+    boundary_path = Path("data/city_boundary.geojson")
     
-    bounds = grid_gdf.geometry.total_bounds  # [west, south, east, north]
+    # Extract city name from place_name (e.g., "Lagos" from "Lagos, Nigeria")
+    city_name = place_name.split(",")[0].strip()
     
-    # Apply buffer to ensure OSM queries have enough features
-    # Grid cells are 0.02°×0.02°, buffer allows fetching surrounding features
-    west, south, east, north = bounds
-    bbox = (west - buffer_deg, south - buffer_deg, east + buffer_deg, north + buffer_deg)
+    # Try multiple queries to find suitable polygon boundary
+    queries = [
+        f"{city_name} State, Nigeria",  # Try state level first
+        f"{city_name}, Nigeria",         # Try city level
+        f"{city_name}",                  # Try without country
+    ]
     
-    print(f"Loaded grid cell extent from {grid_path}")
-    print(f"  Grid bounds: {bounds}")
-    print(f"  Buffered bbox: {bbox}")
-    print(f"  Grid width: {bounds[2] - bounds[0]:.6f}°, height: {bounds[3] - bounds[1]:.6f}°")
-    print(f"  Buffered width: {bbox[2] - bbox[0]:.6f}°, height: {bbox[3] - bbox[1]:.6f}°")
-    return bbox
+    headers = {"User-Agent": "flood-risk-model/1.0"}
+    
+    for query in queries:
+        print(f"[INFO]   Trying query: '{query}'...")
+        try:
+            resp = requests.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={"q": query, "format": "json", "limit": 1, "polygon_geojson": 1},
+                headers=headers,
+                timeout=30
+            )
+            resp.raise_for_status()
+            
+            results = resp.json()
+            if not results:
+                continue
+            
+            result = results[0]
+            if "geojson" not in result:
+                continue
+            
+            geom_dict = result["geojson"]
+            
+            # Only accept polygon geometries, not points
+            if geom_dict.get("type") not in ("Polygon", "MultiPolygon"):
+                print(f"      → {geom_dict.get('type')} (not suitable, need Polygon)")
+                continue
+            
+            boundary_gdf = gpd.GeoDataFrame(
+                {"name": [place_name], "admin_name": [result.get("display_name", "")]},
+                geometry=[shape(geom_dict)],
+                crs="EPSG:4326"
+            )
+            
+            # Save to file
+            boundary_gdf.to_file(boundary_path, driver="GeoJSON")
+            bounds = boundary_gdf.geometry.total_bounds
+            area = boundary_gdf.geometry.area.iloc[0]
+            print(f"      ✓ Success! Saved {result.get('type')} to {boundary_path}")
+            print(f"        Bounds: {bounds}")
+            print(f"        Area: {area:.6f}°²")
+            return boundary_gdf
+            
+        except Exception as e:
+            print(f"      × Error: {e}")
+            continue
+    
+    print(f"[WARNING] Could not fetch city boundary from OSM Nominatim")
+    return None
 
 def load_city_boundary():
     """Load city boundary from GeoJSON file."""
@@ -604,23 +650,24 @@ def main():
 
     print("=== Fetch & Prepare Layers (improved) ===")
     
-    # Load extent: either from grid cells or from geocoding
-    if args.use_grid_cells:
-        print("\n[INFO] Using grid cell extent (--use-grid-cells flag)")
-        bbox = load_grid_cell_extent()
-        if bbox is None:
-            print("[ERROR] Could not load grid cell extent. Falling back to geocoding.")
-            aoi = geocode_aoi(CFG.place_name)
-            bbox = bbox_from_gdf(aoi, buffer_deg=CFG.buffer_deg)
-    else:
-        print("\n[INFO] Using geocoded extent (pass --use-grid-cells to use grid cells instead)")
-        aoi = geocode_aoi(CFG.place_name)
-        bbox = bbox_from_gdf(aoi, buffer_deg=CFG.buffer_deg)
+    # Geocode AOI to get analysis extent
+    print(f"\n[INFO] Geocoding '{CFG.place_name}' to get analysis extent...")
+    aoi = geocode_aoi(CFG.place_name)
+    bbox = bbox_from_gdf(aoi, buffer_deg=CFG.buffer_deg)
+    print(f"  Analysis bbox: {bbox}")
+    
+    # Fetch and save actual city boundary if requested
+    if args.fetch_boundary:
+        print(f"\n[INFO] Fetching actual city boundary from OSM...")
+        boundary_gdf = fetch_and_save_city_boundary(bbox, CFG.place_name)
+        if boundary_gdf is None:
+            print(f"[WARNING] Could not fetch city boundary. Using grid cells instead.")
+    
+    # Load city boundary for masking (either fetched or grid-based)
+    print(f"[INFO] Loading city boundary for masking...")
+    boundary_geom = load_city_boundary()
     
     transform, out_shape = make_raster_grid_from_bbox(bbox, CFG.grid_res_deg)
-
-    # Load city boundary for masking
-    boundary_geom = load_city_boundary()
 
     # Water features
     water_lines, water_polys = fetch_osm_waterways_and_waterpolys(bbox)
