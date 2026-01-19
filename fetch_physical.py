@@ -563,10 +563,13 @@ def fetch_and_save_city_boundary(bbox, place_name="Lagos"):
     city_name = place_name.split(",")[0].strip()
     
     # Try multiple queries to find suitable polygon boundary
+    # First try with full place_name (which may include country)
+    # Then try variations
+    full_place = place_name if "," in place_name else place_name
     queries = [
-        f"{city_name} State, Nigeria",  # Try state level first
-        f"{city_name}, Nigeria",         # Try city level
-        f"{city_name}",                  # Try without country
+        full_place,                      # Full place name as provided (e.g., "Lagos, Nigeria")
+        f"{city_name}",                  # City name only
+        f"{city_name} city",             # City with "city" keyword
     ]
     
     headers = {"User-Agent": "flood-risk-model/1.0"}
