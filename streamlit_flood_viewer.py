@@ -20,6 +20,8 @@ import pandas as pd
 import requests
 import hashlib
 import time
+import subprocess
+import sys
 from pathlib import Path
 
 try:
@@ -139,6 +141,20 @@ def add_onmap_legend(map_obj, img_bytes: bytes, position: str = "bottomright", z
     style = style_by_pos.get(position, style_by_pos["bottomright"])
     html = f'<div style="{style} z-index:{zindex}; background: rgba(255,255,255,0.85); padding:10px; border-radius:8px; box-shadow: 0 2px 6px rgba(0,0,0,0.3);"><img src="data:image/png;base64,{b64}" style="width:{width_px}px; height:auto;" /></div>'
     map_obj.get_root().html.add_child(Element(html))
+
+def _run_fetch_physical(place: str) -> str:
+    """Run fetch_physical.py for a new AOI place and return the tail of logs."""
+    place = (place or "").strip()
+    if not place:
+        place = "Lagos, Nigeria"
+    script_path = str(Path(__file__).resolve().with_name("fetch_physical.py"))
+    cmd = [sys.executable, script_path, "--place", place]
+    p = subprocess.run(cmd, capture_output=True, text=True, cwd=str(Path(script_path).parent))
+    out = (p.stdout or "") + ("\n" + p.stderr if p.stderr else "")
+    if p.returncode != 0:
+        tail = out[-4000:] if out else "<no output>"
+        raise RuntimeError(f"fetch_physical.py failed (code {p.returncode}).\n\n{tail}")
+    return out[-4000:]
 
 # ---- Location search helpers (lat/lon parse, geocode, nearest-grid, raster sampler)
 
@@ -352,6 +368,12 @@ CMAPS = {
 }
 
 # Controls: toggles + WEIGHTS (replaces per-layer opacity sliders)
+st.sidebar.subheader("AOI / data refresh")
+# This is the PLACE NAME used to fetch rasters (OSM + landcover + soil). It is separate from the point "Location search" above.
+_default_aoi = meta.get("aoi_place", "Lagos, Nigeria") if isinstance(meta, dict) else "Lagos, Nigeria"
+aoi_place = st.sidebar.text_input("AOI place to fetch layers for", value=_default_aoi, key="aoi_place_input")
+fetch_first = st.sidebar.checkbox("Fetch physical layers before recompute", value=True, key="fetch_first")
+
 st.sidebar.subheader("Flood index weights (used to recompute flood_risk_0to1)")
 normalize_weights = st.sidebar.checkbox("Normalize weights to sum to 1", value=True, key="normalize_weights")
 
@@ -372,19 +394,31 @@ w_lulc = st.sidebar.slider("Weight: land cover (LULC)",      0.0, 1.0, float(w_d
 
 if st.sidebar.button("Recompute flood_risk_0to1.tif", key="btn_recompute"):
     try:
-        out_path, w_final = recompute_flood_risk(
-            summary_path=summary_path,
-            w_dist=w_dist, w_drainage=w_dd, w_soil=w_soil, w_lulc=w_lulc,
-            out_path_override=None,
-            normalize_weights=normalize_weights,
-        )
-        st.sidebar.success(f"Recomputed: {out_path}")
-        st.sidebar.json({"weights_used": w_final})
-        # reload meta/paths after recompute
+        # 1) Fetch layers for the current AOI (optional)
+        if fetch_first:
+            with st.sidebar.status("Fetching physical layers…", expanded=False):
+                logs = _run_fetch_physical(aoi_place.strip() or _default_aoi)
+                st.sidebar.caption("fetch_physical.py output (tail)")
+                st.sidebar.code(logs)
+
+        # 2) Recompute flood risk using whatever summary_path points to
+        with st.sidebar.status("Recomputing flood risk…", expanded=False):
+            out_path, w_final = recompute_flood_risk(
+                summary_path=summary_path,
+                w_dist=w_dist, w_drainage=w_dd, w_soil=w_soil, w_lulc=w_lulc,
+                out_path_override=None,
+                normalize_weights=normalize_weights,
+            )
+            st.sidebar.success(f"Recomputed: {out_path}")
+            st.sidebar.json({"weights_used": w_final})
+
+        # 3) Reload meta/paths after recompute and rerun so the map updates for the new AOI
         meta = read_summary(summary_path)
         paths = meta["outputs"]
+        st.rerun()
+
     except Exception as e:
-        st.sidebar.error("Failed to recompute flood risk")
+        st.sidebar.error("Failed to fetch/recompute")
         st.sidebar.exception(e)
 
 st.sidebar.markdown("---")
@@ -401,6 +435,124 @@ show_lulc = st.sidebar.checkbox("LULC (worldcover proxy)", value=False, key="tog
 
 
 
+
+
+
+# --------------- Rainfall summary (above map) ----------------
+def _load_meteorology_timeseries(csv_path: str) -> Optional[pd.DataFrame]:
+    """Load meteorology_timeseries.csv and return a dataframe with columns: date, rainfall."""
+    if not csv_path:
+        return None
+    # Try relative to script directory as well as current working dir
+    candidates = []
+    p = Path(csv_path)
+    candidates.append(p)
+    candidates.append(Path(__file__).resolve().parent / csv_path)
+    for cand in candidates:
+        try:
+            if cand.exists():
+                df = pd.read_csv(cand)
+                # Identify datetime column
+                cols_lower = {c: str(c).lower() for c in df.columns}
+                date_col = None
+                for c, cl in cols_lower.items():
+                    if "date" in cl or "time" in cl or "datetime" in cl or cl in ("dt", "timestamp"):
+                        date_col = c
+                        break
+                if date_col is None:
+                    date_col = df.columns[0]
+                df[date_col] = pd.to_datetime(df[date_col], errors="coerce", utc=False)
+                df = df.dropna(subset=[date_col]).copy()
+
+                # Identify rainfall / precip column
+                rain_col = None
+                for c, cl in cols_lower.items():
+                    if any(k in cl for k in ["rain", "rainfall", "precip", "precipitation", "prcp", "ppt"]):
+                        if c != date_col:
+                            rain_col = c
+                            break
+                if rain_col is None:
+                    # choose first numeric column that's not the date
+                    numeric_cols = [c for c in df.columns if c != date_col and pd.api.types.is_numeric_dtype(df[c])]
+                    if numeric_cols:
+                        rain_col = numeric_cols[0]
+
+                if rain_col is None:
+                    return None
+
+                out = df[[date_col, rain_col]].rename(columns={date_col: "date", rain_col: "rainfall"})
+                # Coerce rainfall to numeric (handles strings)
+                out["rainfall"] = pd.to_numeric(out["rainfall"], errors="coerce")
+                out = out.dropna(subset=["rainfall"])
+                return out.sort_values("date")
+        except Exception:
+            continue
+    return None
+
+def _quarterly_rainfall_average(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.copy()
+    d["quarter"] = d["date"].dt.to_period("Q").astype(str)
+    q = (d.groupby("quarter", as_index=False)["rainfall"].mean()
+           .rename(columns={"rainfall": "avg_rainfall"}))
+    return q
+
+# Sidebar control for meteorology csv
+st.sidebar.subheader("Rainfall time series")
+uploaded_csv = st.sidebar.file_uploader("Upload meterology_timeseries.csv (optional)", type=["csv"], key="met_csv")
+csv_path_input = st.sidebar.text_input("...or path to meterology_timeseries.csv", value="meterology_timeseries.csv", key="met_csv_path")
+
+met_df = None
+if uploaded_csv is not None:
+    try:
+        met_df = pd.read_csv(uploaded_csv)
+        # normalize using loader logic by wrapping
+        # (reuse detection by wrapping)
+        tmp_path = None
+        cols_lower = {c: str(c).lower() for c in met_df.columns}
+        date_col = None
+        for c, cl in cols_lower.items():
+            if "date" in cl or "time" in cl or "datetime" in cl or cl in ("dt", "timestamp"):
+                date_col = c
+                break
+        if date_col is None:
+            date_col = met_df.columns[0]
+        met_df[date_col] = pd.to_datetime(met_df[date_col], errors="coerce", utc=False)
+        met_df = met_df.dropna(subset=[date_col]).copy()
+
+        rain_col = None
+        for c, cl in cols_lower.items():
+            if any(k in cl for k in ["rain", "rainfall", "precip", "precipitation", "prcp", "ppt"]):
+                if c != date_col:
+                    rain_col = c
+                    break
+        if rain_col is None:
+            numeric_cols = [c for c in met_df.columns if c != date_col and pd.api.types.is_numeric_dtype(met_df[c])]
+            if numeric_cols:
+                rain_col = numeric_cols[0]
+        if rain_col is not None:
+            met_df = met_df[[date_col, rain_col]].rename(columns={date_col: "date", rain_col: "rainfall"})
+            met_df["rainfall"] = pd.to_numeric(met_df["rainfall"], errors="coerce")
+            met_df = met_df.dropna(subset=["rainfall"]).sort_values("date")
+        else:
+            met_df = None
+    except Exception:
+        met_df = None
+else:
+    met_df = _load_meteorology_timeseries(csv_path_input)
+
+# Render rainfall chart above the map (if data available)
+if met_df is not None and len(met_df) > 0:
+    qdf = _quarterly_rainfall_average(met_df)
+    st.subheader("Quarterly average rainfall")
+    st.caption("Computed from meterology_timeseries.csv (mean rainfall by calendar quarter).")
+    fig, ax = plt.subplots()
+    ax.bar(qdf["quarter"], qdf["avg_rainfall"])
+    ax.set_xlabel("Quarter")
+    ax.set_ylabel("Average rainfall")
+    ax.tick_params(axis="x", rotation=45)
+    st.pyplot(fig, use_container_width=True)
+else:
+    st.info("Rainfall chart: meterology_timeseries.csv not found or could not be parsed. Upload it in the sidebar or set the correct path.")
 
 
 # --------------- Map Build ----------------
