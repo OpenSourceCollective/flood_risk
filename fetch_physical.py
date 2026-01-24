@@ -25,6 +25,7 @@ Run:
 import os, sys, math, json, warnings, argparse
 from dataclasses import dataclass
 from typing import Tuple
+from pathlib import Path
 
 import numpy as np
 import geopandas as gpd
@@ -216,6 +217,53 @@ def save_geotiff(path, array, transform, crs, nodata=None, dtype=None, compress=
     }
     with safe_rio_open(path, "w", **profile) as dst:
         dst.write(array.astype(dtype), 1)
+
+def mask_raster_to_boundary(array, transform, crs, boundary_geom, nodata=None):
+    """
+    Mask a raster array to a boundary polygon (e.g., city boundary).
+    Pixels outside the boundary are set to nodata.
+    
+    Args:
+        array: numpy array (2D raster data)
+        transform: rasterio transform
+        crs: CRS object
+        boundary_geom: shapely geometry (boundary polygon)
+        nodata: value to use for masked pixels (default: 0 for uint8, NaN for float)
+    
+    Returns:
+        masked_array: array with pixels outside boundary set to nodata
+    """
+    from rasterio.mask import mask as rasterio_mask
+    from rasterio.io import MemoryFile
+    
+    # Determine nodata value if not provided
+    if nodata is None:
+        if np.issubdtype(array.dtype, np.floating):
+            nodata = np.nan
+        else:
+            nodata = 0
+    
+    # Create a temporary in-memory raster
+    profile = {
+        "driver": "GTiff",
+        "height": array.shape[0],
+        "width": array.shape[1],
+        "count": 1,
+        "dtype": array.dtype,
+        "crs": crs,
+        "transform": transform,
+        "nodata": nodata,
+    }
+    
+    # Write array to memory and immediately mask
+    with MemoryFile() as memfile:
+        with memfile.open(**profile) as mem_src:
+            mem_src.write(array, 1)
+        
+        # Mask using the boundary geometry
+        with memfile.open() as mem_src:
+            masked_array, _ = rasterio_mask(mem_src, [boundary_geom], crop=False, nodata=nodata)
+            return masked_array[0]
 
 def rasterize_geoms(geoms, out_shape, transform, burn_value=1, all_touched=False, dtype="uint8"):
     if len(geoms) == 0:
@@ -424,7 +472,7 @@ def reclassify_io_to_proxy(io_arr):
     out[(io_arr == 7) | (io_arr == 8)] = 6
     return out
 
-def fetch_worldcover_or_io_to_grid(bbox, target_transform, target_shape, out_path_wc, out_path_io, year=2024):
+def fetch_worldcover_or_io_to_grid(bbox, target_transform, target_shape, out_path_wc, out_path_io, year=2024, boundary_geom=None, crs=None):
     srcs = fetch_worldcover_items(bbox, year=year)
     label = None
     if not srcs:
@@ -474,6 +522,10 @@ def fetch_worldcover_or_io_to_grid(bbox, target_transform, target_shape, out_pat
         out_path = out_path_wc
         provider = "ESA WorldCover"
 
+    # Apply boundary masking if provided
+    if boundary_geom is not None and crs is not None:
+        proxy = mask_raster_to_boundary(proxy, target_transform, crs, boundary_geom, nodata=0)
+
     save_geotiff(out_path, proxy, target_transform, CRS.from_epsg(4326), nodata=0, dtype="uint8")
     return out_path, provider
 
@@ -486,7 +538,105 @@ def parse_args():
     ap.add_argument("--soil-res-m", type=int, default=CFG.soil_res_m)
     ap.add_argument("--smooth-sigma", type=float, default=CFG.smooth_drainage_sigma)
     ap.add_argument("--worldcover-year", type=int, default=CFG.worldcover_year)
+    ap.add_argument("--fetch-boundary", action="store_true",
+                    help="Fetch actual city boundary from OSM Nominatim (recommended on first run)")
     return ap.parse_args()
+
+def fetch_and_save_city_boundary(bbox, place_name="Lagos"):
+    """
+    Fetch actual city/admin boundary from OSM Nominatim.
+    Save to data/city_boundary.geojson.
+    
+    Args:
+        bbox: Bounding box to search within
+        place_name: Name of place to query (e.g., "Lagos, Nigeria")
+    
+    Returns:
+        GeoDataFrame with boundary geometry
+    """
+    import requests
+    from shapely.geometry import shape
+    
+    boundary_path = Path("data/city_boundary.geojson")
+    
+    # Extract city name from place_name (e.g., "Lagos" from "Lagos, Nigeria")
+    city_name = place_name.split(",")[0].strip()
+    
+    # Try multiple queries to find suitable polygon boundary
+    # First try with full place_name (which may include country)
+    # Then try variations
+    full_place = place_name if "," in place_name else place_name
+    queries = [
+        full_place,                      # Full place name as provided (e.g., "Lagos, Nigeria")
+        f"{city_name}",                  # City name only
+        f"{city_name} city",             # City with "city" keyword
+    ]
+    
+    headers = {"User-Agent": "flood-risk-model/1.0"}
+    
+    for query in queries:
+        print(f"[INFO]   Trying query: '{query}'...")
+        try:
+            resp = requests.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={"q": query, "format": "json", "limit": 1, "polygon_geojson": 1},
+                headers=headers,
+                timeout=30
+            )
+            resp.raise_for_status()
+            
+            results = resp.json()
+            if not results:
+                continue
+            
+            result = results[0]
+            if "geojson" not in result:
+                continue
+            
+            geom_dict = result["geojson"]
+            
+            # Only accept polygon geometries, not points
+            if geom_dict.get("type") not in ("Polygon", "MultiPolygon"):
+                print(f"      → {geom_dict.get('type')} (not suitable, need Polygon)")
+                continue
+            
+            boundary_gdf = gpd.GeoDataFrame(
+                {"name": [place_name], "admin_name": [result.get("display_name", "")]},
+                geometry=[shape(geom_dict)],
+                crs="EPSG:4326"
+            )
+            
+            # Save to file
+            boundary_gdf.to_file(boundary_path, driver="GeoJSON")
+            bounds = boundary_gdf.geometry.total_bounds
+            area = boundary_gdf.geometry.area.iloc[0]
+            print(f"      ✓ Success! Saved {result.get('type')} to {boundary_path}")
+            print(f"        Bounds: {bounds}")
+            print(f"        Area: {area:.6f}°²")
+            return boundary_gdf
+            
+        except Exception as e:
+            print(f"      × Error: {e}")
+            continue
+    
+    print(f"[WARNING] Could not fetch city boundary from OSM Nominatim")
+    return None
+
+def load_city_boundary():
+    """Load city boundary from GeoJSON file."""
+    boundary_path = "data/city_boundary.geojson"
+    if not os.path.exists(boundary_path):
+        print(f"[WARNING] City boundary not found at {boundary_path}. Skipping masking.")
+        return None
+    
+    boundary_gdf = gpd.read_file(boundary_path)
+    if boundary_gdf.empty:
+        print("[WARNING] City boundary GeoJSON is empty. Skipping masking.")
+        return None
+    
+    boundary_geom = boundary_gdf.geometry.iloc[0]
+    print(f"Loaded city boundary from {boundary_path}")
+    return boundary_geom
 
 def main():
     args = parse_args()
@@ -502,27 +652,47 @@ def main():
     crs = CRS.from_epsg(CFG.crs_epsg)
 
     print("=== Fetch & Prepare Layers (improved) ===")
+    
+    # Geocode AOI to get analysis extent
+    print(f"\n[INFO] Geocoding '{CFG.place_name}' to get analysis extent...")
     aoi = geocode_aoi(CFG.place_name)
     bbox = bbox_from_gdf(aoi, buffer_deg=CFG.buffer_deg)
+    print(f"  Analysis bbox: {bbox}")
+    
+    # Fetch and save actual city boundary if requested
+    if args.fetch_boundary:
+        print(f"\n[INFO] Fetching actual city boundary from OSM...")
+        boundary_gdf = fetch_and_save_city_boundary(bbox, CFG.place_name)
+        if boundary_gdf is None:
+            print(f"[WARNING] Could not fetch city boundary. Using grid cells instead.")
+    
+    # Load city boundary for masking (either fetched or grid-based)
+    print(f"[INFO] Loading city boundary for masking...")
+    boundary_geom = load_city_boundary()
+    
     transform, out_shape = make_raster_grid_from_bbox(bbox, CFG.grid_res_deg)
 
     # Water features
     water_lines, water_polys = fetch_osm_waterways_and_waterpolys(bbox)
 
     dist = compute_distance_to_water_raster(water_lines, water_polys, transform, out_shape, grid_res_deg=CFG.grid_res_deg)
+    if boundary_geom is not None:
+        dist = mask_raster_to_boundary(dist, transform, crs, boundary_geom, nodata=np.nan)
     dist_path = os.path.join(CFG.out_dir, "dist_to_river_m.tif")
     save_geotiff(dist_path, dist, transform, crs, nodata=np.nan, dtype="float32")
 
     dd_grid = compute_drainage_density_grid(water_lines, bbox, CFG.fishnet_cell_deg)
     dd = rasterize_grid_values(dd_grid, "dd_km_per_km2", transform, out_shape)
     dd = smooth_raster(dd, CFG.smooth_drainage_sigma)
+    if boundary_geom is not None:
+        dd = mask_raster_to_boundary(dd, transform, crs, boundary_geom, nodata=0.0)
     dd_path = os.path.join(CFG.out_dir, "drainage_density_km_per_km2.tif")
     save_geotiff(dd_path, dd, transform, crs, nodata=0.0, dtype="float32")
 
     # LULC
     wc_out = os.path.join(CFG.out_dir, "lulc_worldcover_proxy.tif")
     io_out = os.path.join(CFG.out_dir, "lulc_io_annual_proxy.tif")
-    lulc_path, provider = fetch_worldcover_or_io_to_grid(bbox, transform, out_shape, wc_out, io_out, year=CFG.worldcover_year)
+    lulc_path, provider = fetch_worldcover_or_io_to_grid(bbox, transform, out_shape, wc_out, io_out, year=CFG.worldcover_year, boundary_geom=boundary_geom, crs=crs)
 
     # Soil
     soil_raw = os.path.join(CFG.tmp_dir, "soil_sand_raw.tif")
@@ -553,6 +723,13 @@ def main():
                 dst_crs="EPSG:4326",
                 resampling=rasterio.warp.Resampling.bilinear,
             )
+    
+    # Load soil raster and apply masking
+    if boundary_geom is not None:
+        with safe_rio_open(soil_path) as src:
+            soil_data = src.read(1)
+            soil_data = mask_raster_to_boundary(soil_data, transform, crs, boundary_geom, nodata=0.0)
+        save_geotiff(soil_path, soil_data, transform, crs, nodata=0.0, dtype="float32")
 
     outputs = {
         "dist_to_river_m": dist_path,

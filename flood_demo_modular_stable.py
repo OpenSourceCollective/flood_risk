@@ -22,6 +22,7 @@ Run (CLI):
 import os, sys, json, argparse
 import numpy as np
 import rasterio
+import geopandas as gpd
 
 def robust_minmax(x: np.ndarray, lower_q=2.0, upper_q=98.0) -> np.ndarray:
     """Percentile-based min-max scaling to [0,1] with outlier resistance."""
@@ -69,6 +70,44 @@ def _pick_lulc_key(outputs: dict) -> str:
     raise KeyError("No LULC proxy raster key found in meta['outputs']. Expected one of "
                    "lulc_worldcover_proxy, lulc_io_annual_proxy, lulc_proxy, lulc.")
 
+def load_city_boundary():
+    """Load city boundary from GeoJSON file."""
+    boundary_path = "data/city_boundary.geojson"
+    if not os.path.exists(boundary_path):
+        return None
+    try:
+        boundary_gdf = gpd.read_file(boundary_path)
+        if boundary_gdf.empty:
+            return None
+        return boundary_gdf.geometry.iloc[0]
+    except Exception as e:
+        print(f"[WARNING] Could not load city boundary: {e}")
+        return None
+
+def mask_raster_with_boundary(array, transform, crs, boundary_geom, nodata=np.nan):
+    """Mask raster array to city boundary polygon."""
+    from rasterio.mask import mask as rasterio_mask
+    from rasterio.io import MemoryFile
+    
+    profile = {
+        "driver": "GTiff",
+        "height": array.shape[0],
+        "width": array.shape[1],
+        "count": 1,
+        "dtype": array.dtype,
+        "crs": crs,
+        "transform": transform,
+        "nodata": nodata,
+    }
+    
+    with MemoryFile() as memfile:
+        with memfile.open(**profile) as mem_src:
+            mem_src.write(array, 1)
+        
+        with memfile.open() as mem_src:
+            masked_array, _ = rasterio_mask(mem_src, [boundary_geom], crop=False, nodata=nodata)
+            return masked_array[0]
+
 def run(summary_path, w_dist=0.35, w_drainage=0.25, w_soil=0.20, w_lulc=0.20,
         out_path_override=None, normalize_weights=False):
     """
@@ -100,6 +139,12 @@ def run(summary_path, w_dist=0.35, w_drainage=0.25, w_soil=0.20, w_lulc=0.20,
             weights = {k: v/s for k, v in weights.items()}
 
     risk01 = compute_risk(dist, dd, soil, lulc, weights)
+
+    # Load and apply city boundary masking
+    boundary_geom = load_city_boundary()
+    if boundary_geom is not None:
+        risk01 = mask_raster_with_boundary(risk01, transform, crs, boundary_geom, nodata=np.nan)
+        print("[INFO] Applied city boundary masking to flood risk raster")
 
     out_path = out_path_override or os.path.join(os.path.dirname(summary_path), "flood_risk_0to1.tif")
     profile = {
