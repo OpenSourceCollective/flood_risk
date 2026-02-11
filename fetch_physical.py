@@ -570,8 +570,28 @@ def fetch_and_save_city_boundary(bbox, place_name="Lagos", max_retries=2, show_f
                 continue
     
     if show_feedback:
-        print(f"[WARNING] Could not fetch city boundary from OSM Nominatim after {max_retries} attempt(s)")
-    return None
+        print(f"[WARNING] Could not fetch city polygon from OSM Nominatim after {max_retries} attempt(s)")
+        print(f"[INFO]    Creating fallback bbox-based boundary...")
+    
+    # Fallback: create a bbox-based boundary (rectangle)
+    # This ensures masking still works, even if not with a perfect polygon
+    try:
+        from shapely.geometry import box
+        minx, miny, maxx, maxy = bbox
+        bbox_poly = box(minx, miny, maxx, maxy)
+        boundary_gdf = gpd.GeoDataFrame(
+            {"name": [place_name], "admin_name": ["bbox_fallback"]},
+            geometry=[bbox_poly],
+            crs="EPSG:4326"
+        )
+        boundary_gdf.to_file(boundary_path, driver="GeoJSON")
+        if show_feedback:
+            print(f"      ✓ Saved fallback bbox boundary to {boundary_path}")
+        return boundary_gdf
+    except Exception as e:
+        if show_feedback:
+            print(f"      × Failed to create fallback boundary: {e}")
+        return None
 
 def load_city_boundary():
     """Load city boundary from GeoJSON file."""
@@ -674,23 +694,43 @@ def main():
     if args.auto_fetch_boundary:
         print(f"[INFO] Loading or fetching city boundary for masking...")
         boundary_geom = load_city_boundary()
-        
-        # Check if boundary is missing or is just the AOI bbox (placeholder)
+
+        # Also try to read the saved boundary file to determine which place it represents
+        saved_place_name = None
+        try:
+            if os.path.exists("data/city_boundary.geojson"):
+                saved_gdf = gpd.read_file("data/city_boundary.geojson")
+                if not saved_gdf.empty and "name" in saved_gdf.columns:
+                    saved_place_name = str(saved_gdf["name"].iloc[0])
+        except Exception:
+            saved_place_name = None
+
+        # Check if boundary is missing, is just the AOI bbox (placeholder),
+        # or represents a different place than requested. In any of these
+        # cases we should attempt to auto-fetch.
         try:
             need_fetch = False
             if boundary_geom is None:
                 need_fetch = True
             else:
-                # Compare boundary bounds to analysis bbox; if they match closely,
-                # the boundary is likely just a bbox placeholder.
-                bminx, bminy, bmaxx, bmaxy = boundary_geom.bounds
-                tol = max(1e-6, CFG.grid_res_deg * 2)
-                if (abs(bminx - bbox[0]) <= tol and abs(bminy - bbox[1]) <= tol and
-                    abs(bmaxx - bbox[2]) <= tol and abs(bmaxy - bbox[3]) <= tol):
+                # If the saved boundary has a `name` and it differs from the
+                # requested place, force a refetch so we don't reuse another
+                # city's polygon (e.g., Nairobi when requesting Lagos).
+                if saved_place_name and saved_place_name.strip().lower() != CFG.place_name.strip().lower():
                     need_fetch = True
                     if args.boundary_fetch_feedback:
-                        print(f"[INFO] Detected bbox placeholder boundary; fetching real polygon...")
-            
+                        print(f"[INFO] Detected saved boundary for '{saved_place_name}'; requested '{CFG.place_name}' -> refetching...")
+                else:
+                    # Compare boundary bounds to analysis bbox; if they match closely,
+                    # the boundary is likely just a bbox placeholder.
+                    bminx, bminy, bmaxx, bmaxy = boundary_geom.bounds
+                    tol = max(1e-6, CFG.grid_res_deg * 2)
+                    if (abs(bminx - bbox[0]) <= tol and abs(bminy - bbox[1]) <= tol and
+                        abs(bmaxx - bbox[2]) <= tol and abs(bmaxy - bbox[3]) <= tol):
+                        need_fetch = True
+                        if args.boundary_fetch_feedback:
+                            print(f"[INFO] Detected bbox placeholder boundary; fetching real polygon...")
+
             if need_fetch:
                 if args.boundary_fetch_feedback:
                     print(f"[INFO] Attempting to fetch actual city boundary from OSM (auto)...")
