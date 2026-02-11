@@ -1,0 +1,9 @@
+/Users/soyatoye/Documents/AXUM/flood/flood_risk/.venv/lib/python3.14/site-packages/numpy/lib/_nanfunctions_impl.py:1406: RuntimeWarning: All-NaN slice encountered
+  return _nanquantile_unchecked(
+/Users/soyatoye/Documents/AXUM/flood/flood_risk/flood_demo_modular_stable.py:32: RuntimeWarning: All-NaN slice encountered
+  lo = np.nanmin(x); hi = np.nanmax(x)
+/Users/soyatoye/Documents/AXUM/flood/flood_risk/.venv/lib/python3.14/site-packages/rasterio/mask.py:88: UserWarning: shapes are outside bounds of raster. Are they in different coordinate reference systems?
+  warnings.warn('shapes are outside bounds of raster. '
+[INFO] Applied city boundary masking to flood risk raster
+Saved flood risk: data/rasters/flood_risk_0to1.tif
+Updated summary: data/rasters/prepared_layers_summary.json

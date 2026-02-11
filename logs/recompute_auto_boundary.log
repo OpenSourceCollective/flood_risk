@@ -1,0 +1,3 @@
+[INFO] Applied city boundary masking to flood risk raster
+Saved flood risk: data/rasters/flood_risk_0to1.tif
+Updated summary: data/rasters/prepared_layers_summary.json

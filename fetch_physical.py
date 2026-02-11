@@ -25,6 +25,7 @@ Run:
 import os, sys, math, json, warnings, argparse
 from dataclasses import dataclass
 from typing import Tuple
+from pathlib import Path
 
 import numpy as np
 import geopandas as gpd
@@ -477,6 +478,162 @@ def fetch_worldcover_or_io_to_grid(bbox, target_transform, target_shape, out_pat
     save_geotiff(out_path, proxy, target_transform, CRS.from_epsg(4326), nodata=0, dtype="uint8")
     return out_path, provider
 
+def fetch_and_save_city_boundary(bbox, place_name="Lagos", max_retries=2, show_feedback=False):
+    """
+    Fetch actual city/admin boundary from OSM Nominatim.
+    Save to data/city_boundary.geojson.
+    
+    Args:
+        bbox: Bounding box to search within
+        place_name: Name of place to query (e.g., "Lagos, Nigeria")
+        max_retries: Number of retries for failed requests
+        show_feedback: If True, print progress messages
+    
+    Returns:
+        GeoDataFrame with boundary geometry, or None if all retries failed
+    """
+    from shapely.geometry import shape
+    boundary_path = Path("data/city_boundary.geojson")
+    
+    # Extract city name from place_name (e.g., "Lagos" from "Lagos, Nigeria")
+    city_name = place_name.split(",")[0].strip()
+    
+    # Try multiple queries to find suitable polygon boundary
+    queries = [
+        place_name,                      # Full place name as provided
+        f"{city_name}",                  # City name only
+        f"{city_name} city",             # City with "city" keyword
+    ]
+    
+    headers = {"User-Agent": "flood-risk-model/1.0"}
+    
+    for query in queries:
+        if show_feedback:
+            print(f"[INFO]   Trying query: '{query}'...")
+        
+        for attempt in range(max_retries):
+            try:
+                resp = requests.get(
+                    "https://nominatim.openstreetmap.org/search",
+                    params={"q": query, "format": "json", "limit": 1, "polygon_geojson": 1},
+                    headers=headers,
+                    timeout=30
+                )
+                resp.raise_for_status()
+                
+                results = resp.json()
+                if not results:
+                    if show_feedback and attempt == max_retries - 1:
+                        print(f"      → No results for '{query}'")
+                    continue
+                
+                result = results[0]
+                if "geojson" not in result:
+                    if show_feedback and attempt == max_retries - 1:
+                        print(f"      → No geojson in result")
+                    continue
+                
+                geom_dict = result["geojson"]
+                
+                # Only accept polygon geometries, not points
+                if geom_dict.get("type") not in ("Polygon", "MultiPolygon"):
+                    if show_feedback and attempt == max_retries - 1:
+                        print(f"      → {geom_dict.get('type')} (not suitable, need Polygon)")
+                    continue
+                
+                boundary_gdf = gpd.GeoDataFrame(
+                    {"name": [place_name], "admin_name": [result.get("display_name", "")]},
+                    geometry=[shape(geom_dict)],
+                    crs="EPSG:4326"
+                )
+                
+                # Save to file
+                boundary_gdf.to_file(boundary_path, driver="GeoJSON")
+                bounds = boundary_gdf.geometry.total_bounds
+                area = boundary_gdf.geometry.area.iloc[0]
+                if show_feedback:
+                    print(f"      ✓ Success! Saved {result.get('type')} to {boundary_path}")
+                    print(f"        Bounds: {bounds}")
+                    print(f"        Area: {area:.6f}°²")
+                return boundary_gdf
+                
+            except requests.exceptions.RequestException as e:
+                if show_feedback and attempt == max_retries - 1:
+                    print(f"      × Request error (attempt {attempt + 1}/{max_retries}): {e}")
+                elif show_feedback and attempt < max_retries - 1:
+                    import time
+                    time.sleep(1)  # Brief delay before retry
+                continue
+            except Exception as e:
+                if show_feedback and attempt == max_retries - 1:
+                    print(f"      × Error (attempt {attempt + 1}/{max_retries}): {e}")
+                continue
+    
+    if show_feedback:
+        print(f"[WARNING] Could not fetch city boundary from OSM Nominatim after {max_retries} attempt(s)")
+    return None
+
+def load_city_boundary():
+    """Load city boundary from GeoJSON file."""
+    boundary_path = "data/city_boundary.geojson"
+    if not os.path.exists(boundary_path):
+        return None
+    
+    boundary_gdf = gpd.read_file(boundary_path)
+    if boundary_gdf.empty:
+        return None
+    
+    boundary_geom = boundary_gdf.geometry.iloc[0]
+    return boundary_geom
+
+def mask_raster_to_boundary(array, transform, crs, boundary_geom, nodata=None):
+    """
+    Mask a raster array to a boundary polygon (e.g., city boundary).
+    Pixels outside the boundary are set to nodata.
+    
+    Args:
+        array: numpy array (2D raster data)
+        transform: rasterio transform
+        crs: CRS object
+        boundary_geom: shapely geometry (boundary polygon)
+        nodata: value to use for masked pixels (default: 0 for uint8, NaN for float)
+    
+    Returns:
+        masked_array: array with pixels outside boundary set to nodata
+    """
+    from rasterio.mask import mask as rasterio_mask
+    from rasterio.io import MemoryFile
+    
+    # Determine nodata value if not provided
+    if nodata is None:
+        if np.issubdtype(array.dtype, np.floating):
+            nodata = np.nan
+        else:
+            nodata = 0
+    
+    # Create a temporary in-memory raster
+    profile = {
+        "driver": "GTiff",
+        "height": array.shape[0],
+        "width": array.shape[1],
+        "count": 1,
+        "dtype": array.dtype,
+        "crs": crs,
+        "transform": transform,
+        "nodata": nodata,
+    }
+    
+    # Write array to memory and immediately mask
+    with MemoryFile() as memfile:
+        with memfile.open(**profile) as mem_src:
+            mem_src.write(array, 1)
+        
+        # Mask using the boundary geometry
+        with memfile.open() as mem_src:
+            masked_array, _ = rasterio_mask(mem_src, [boundary_geom], crop=False, nodata=nodata)
+    
+    return masked_array[0]
+
 def parse_args():
     ap = argparse.ArgumentParser(description="Fetch & prepare physical flood layers (improved).")
     ap.add_argument("--place", default=CFG.place_name)
@@ -486,6 +643,12 @@ def parse_args():
     ap.add_argument("--soil-res-m", type=int, default=CFG.soil_res_m)
     ap.add_argument("--smooth-sigma", type=float, default=CFG.smooth_drainage_sigma)
     ap.add_argument("--worldcover-year", type=int, default=CFG.worldcover_year)
+    ap.add_argument("--auto-fetch-boundary", action="store_true", default=True,
+                    help="Auto-fetch city boundary if missing or is a bbox (default: enabled)")
+    ap.add_argument("--no-auto-fetch-boundary", dest="auto_fetch_boundary", action="store_false",
+                    help="Disable auto-fetch of city boundary")
+    ap.add_argument("--boundary-fetch-feedback", action="store_true", default=False,
+                    help="Show detailed feedback during boundary fetch (for debugging)")
     return ap.parse_args()
 
 def main():
@@ -504,18 +667,64 @@ def main():
     print("=== Fetch & Prepare Layers (improved) ===")
     aoi = geocode_aoi(CFG.place_name)
     bbox = bbox_from_gdf(aoi, buffer_deg=CFG.buffer_deg)
+    print(f"  Analysis bbox: {bbox}")
+    
+    # Auto-fetch city boundary if enabled
+    boundary_geom = None
+    if args.auto_fetch_boundary:
+        print(f"[INFO] Loading or fetching city boundary for masking...")
+        boundary_geom = load_city_boundary()
+        
+        # Check if boundary is missing or is just the AOI bbox (placeholder)
+        try:
+            need_fetch = False
+            if boundary_geom is None:
+                need_fetch = True
+            else:
+                # Compare boundary bounds to analysis bbox; if they match closely,
+                # the boundary is likely just a bbox placeholder.
+                bminx, bminy, bmaxx, bmaxy = boundary_geom.bounds
+                tol = max(1e-6, CFG.grid_res_deg * 2)
+                if (abs(bminx - bbox[0]) <= tol and abs(bminy - bbox[1]) <= tol and
+                    abs(bmaxx - bbox[2]) <= tol and abs(bmaxy - bbox[3]) <= tol):
+                    need_fetch = True
+                    if args.boundary_fetch_feedback:
+                        print(f"[INFO] Detected bbox placeholder boundary; fetching real polygon...")
+            
+            if need_fetch:
+                if args.boundary_fetch_feedback:
+                    print(f"[INFO] Attempting to fetch actual city boundary from OSM (auto)...")
+                fetched = fetch_and_save_city_boundary(
+                    bbox, CFG.place_name, max_retries=2, show_feedback=args.boundary_fetch_feedback
+                )
+                if fetched is not None:
+                    # reload geometry
+                    boundary_geom = load_city_boundary()
+                else:
+                    if args.boundary_fetch_feedback:
+                        print("[WARNING] Auto-fetch failed; continuing without polygon masking.")
+        except Exception as e:
+            if args.boundary_fetch_feedback:
+                print(f"[WARNING] Exception while auto-fetching boundary: {e}")
+    
     transform, out_shape = make_raster_grid_from_bbox(bbox, CFG.grid_res_deg)
 
     # Water features
     water_lines, water_polys = fetch_osm_waterways_and_waterpolys(bbox)
 
     dist = compute_distance_to_water_raster(water_lines, water_polys, transform, out_shape, grid_res_deg=CFG.grid_res_deg)
+    if boundary_geom is not None:
+        # Mask distance raster to city boundary
+        dist = mask_raster_to_boundary(dist, transform, crs, boundary_geom, nodata=np.nan)
     dist_path = os.path.join(CFG.out_dir, "dist_to_river_m.tif")
     save_geotiff(dist_path, dist, transform, crs, nodata=np.nan, dtype="float32")
 
     dd_grid = compute_drainage_density_grid(water_lines, bbox, CFG.fishnet_cell_deg)
     dd = rasterize_grid_values(dd_grid, "dd_km_per_km2", transform, out_shape)
     dd = smooth_raster(dd, CFG.smooth_drainage_sigma)
+    if boundary_geom is not None:
+        # Mask drainage raster to city boundary
+        dd = mask_raster_to_boundary(dd, transform, crs, boundary_geom, nodata=0.0)
     dd_path = os.path.join(CFG.out_dir, "drainage_density_km_per_km2.tif")
     save_geotiff(dd_path, dd, transform, crs, nodata=0.0, dtype="float32")
 

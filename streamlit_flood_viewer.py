@@ -83,8 +83,21 @@ def add_image_overlay(m, img_rgba: np.ndarray, bounds, name: str, opacity: float
     overlay.add_to(m)
 
 def make_continuous_legend_png(cmap_name: str, vmin: float, vmax: float, title: str, width_px=260) -> bytes:
-    fig, ax = plt.subplots(figsize=(3.2, 1.0), dpi=200)
-    fig.subplots_adjust(bottom=0.35, top=0.85, left=0.08, right=0.98)
+    # Convert numpy RGBA array to PIL Image with proper alpha channel preservation
+    pil_img = Image.fromarray(img_rgba, mode='RGBA')
+    
+    # Encode to PNG bytes (preserves alpha/transparency)
+    bio = BytesIO()
+    pil_img.save(bio, format='PNG')
+    bio.seek(0)
+    png_data = bio.getvalue()
+    
+    # Encode as base64 data URI for folium
+    b64_png = base64.b64encode(png_data).decode('utf-8')
+    img_url = f"data:image/png;base64,{b64_png}"
+    
+    overlay = folium.raster_layers.ImageOverlay(
+        image=img_urlt(bottom=0.35, top=0.85, left=0.08, right=0.98)
     cmap = matplotlib.colormaps.get_cmap(cmap_name)
     norm = matplotlib.colors.Normalize(vmin=vmin, vmax=vmax)
     cb = matplotlib.colorbar.ColorbarBase(ax, cmap=cmap, norm=norm, orientation="horizontal")
@@ -129,7 +142,7 @@ def add_onmap_legend(map_obj, img_bytes: bytes, position: str = "bottomright", z
 
 # ---------------- Sidebar ----------------
 
-st.sidebar.title("Layers")
+# Load summary and paths early
 summary_path = st.sidebar.text_input("Summary JSON path", value="data/rasters/prepared_layers_summary.json", key="summary_path_input")
 if not os.path.exists(summary_path):
     st.error("Summary JSON not found. Run the fetch step first.")
@@ -137,6 +150,73 @@ if not os.path.exists(summary_path):
 
 meta = read_summary(summary_path)
 paths = meta["outputs"]
+
+# Session state initialization for AOI-related caching
+if "cached_aoi_place" not in st.session_state:
+    st.session_state.cached_aoi_place = None
+
+st.sidebar.markdown("---")
+st.sidebar.title("Area of Interest")
+
+# Helper to run fetch_physical in-process
+def run_fetch_physical(place_name):
+    """Run fetch_physical.py with the given place name, importing directly."""
+    try:
+        import sys
+        
+        # Save original sys.argv
+        original_argv = sys.argv
+        
+        try:
+            # Set up arguments for fetch_physical
+            sys.argv = ["fetch_physical.py", "--place", place_name, "--auto-fetch-boundary"]
+            
+            # Import and run fetch_physical.main()
+            from fetch_physical import main as fetch_main
+            fetch_main()
+            
+            return True, "✓ Fetched and prepared layers successfully."
+        finally:
+            # Restore original sys.argv
+            sys.argv = original_argv
+    except Exception as e:
+        return False, f"✗ Failed to fetch: {str(e)}"
+
+# AOI place input with auto-fetch
+_default_aoi = meta.get("aoi_place", "Lagos, Nigeria")
+aoi_place = st.sidebar.text_input(
+    "AOI place to fetch layers for (format: 'City, Country')",
+    value=_default_aoi,
+    key="aoi_place_input",
+    placeholder="e.g., Accra, Ghana"
+)
+
+# Validate format
+if aoi_place.strip() and "," not in aoi_place:
+    st.sidebar.warning("⚠ Please use format: 'City, Country'")
+
+# Check if AOI changed and auto-fetch if needed
+current_aoi_lower = (aoi_place.strip() or _default_aoi).lower()
+cached_aoi_lower = (st.session_state.cached_aoi_place or "").lower()
+summary_aoi_lower = (meta.get("aoi_place", _default_aoi) or _default_aoi).lower()
+
+if current_aoi_lower != cached_aoi_lower and current_aoi_lower != summary_aoi_lower:
+    with st.sidebar.status(f"Fetching layers for '{aoi_place.strip()}'...", expanded=True) as status:
+        success, message = run_fetch_physical(aoi_place.strip())
+        if success:
+            st.sidebar.success(message)
+            st.session_state.cached_aoi_place = aoi_place.strip()
+            # Reload summary and paths from disk
+            meta = read_summary(summary_path)
+            paths = meta["outputs"]
+            status.update(label="✓ Done", state="complete")
+            st.rerun()  # Refresh to show new data
+        else:
+            st.sidebar.error(message)
+            status.update(label="✗ Failed", state="error")
+
+st.sidebar.markdown("---")
+st.sidebar.title("Layers")
 
 # Fixed cmaps
 CMAPS = {

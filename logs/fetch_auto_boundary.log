@@ -1,0 +1,22 @@
+/Users/soyatoye/Documents/AXUM/flood/flood_risk/.venv/lib/python3.14/site-packages/pystac_client/item_search.py:925: FutureWarning: get_items() is deprecated, use items() instead
+  warnings.warn(
+=== Fetch & Prepare Layers (improved) ===
+
+[INFO] Geocoding 'Accra, Ghana' to get analysis extent...
+  Analysis bbox: (-0.3041318, 5.4971908, -0.0348565, 5.6873682)
+[INFO] Loading city boundary for masking...
+Loaded city boundary from data/city_boundary.geojson
+
+[INFO] Attempting to fetch actual city boundary from OSM (auto)...
+[INFO]   Trying query: 'Accra, Ghana'...
+      ✓ Success! Saved administrative to data/city_boundary.geojson
+        Bounds: [-0.2841318  5.5171908 -0.0548565  5.6673682]
+        Area: 0.018739°²
+Loaded city boundary from data/city_boundary.geojson
+[DEBUG] Merging 2 LULC tiles...
+[DEBUG] Opening reprojected LULC: data/tmp/lulc_reproj.tif
+[SoilGrids] Requesting WCS: https://maps.isric.org/mapserv?map=/map/sand.map&SERVICE=WCS&VERSION=2.0.1&REQUEST=GetCoverage&COVERAGEID=sand_0-5cm_Q0.5&FORMAT=GEOTIFF_INT16&SUBSET=long(-0.3041318,-0.0348565)&SUBSET=lat(5.4971908,5.6873682)&RESX=250m&RESY=250m&CRS=EPSG:4326&SUBSETTINGCRS=EPSG:4326&OUTPUTCRS=EPSG:4326
+[SoilGrids] Saved: data/tmp/soil_sand_raw.tif
+[DEBUG] Opening SoilGrids raster: data/tmp/soil_sand_raw.tif
+Wrote: data/rasters/prepared_layers_summary.json
+=== Done ===

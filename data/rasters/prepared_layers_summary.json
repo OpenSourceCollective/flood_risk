@@ -1,10 +1,10 @@
 {
-  "aoi_place": "Accra, Ghana",
+  "aoi_place": "Lagos, Nigeria",
   "bbox": [
-    -0.3041318,
-    5.4971908,
-    -0.0348565,
-    5.6873682
+    2.6859846,
+    6.346684000000001,
+    4.3709055999999995,
+    6.7167964
   ],
   "grid_res_deg": 0.001,
   "fishnet_cell_deg": 0.005,
@@ -18,18 +18,10 @@
     "soil_sand_pct": "data/rasters/soil_sand_pct.tif",
     "lulc": "data/rasters/lulc_worldcover_proxy.tif",
     "lulc_proxy": "data/rasters/lulc_worldcover_proxy.tif",
-    "lulc_worldcover_proxy": "data/rasters/lulc_worldcover_proxy.tif",
-    "flood_risk_0to1": "data/rasters/flood_risk_0to1.tif"
+    "lulc_worldcover_proxy": "data/rasters/lulc_worldcover_proxy.tif"
   },
   "notes": {
     "dist_to_river_m": "Improved: distance to union(OSM waterways + inland water polygons).",
     "drainage_density_km_per_km2": "Improved: smaller fishnet + optional Gaussian smoothing."
-  },
-  "flood_risk_weights_used": {
-    "dist": 0.35,
-    "drainage": 0.25,
-    "soil": 0.2,
-    "lulc": 0.2
-  },
-  "lulc_key_used": "lulc_worldcover_proxy"
+  }
 }
