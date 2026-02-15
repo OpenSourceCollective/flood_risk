@@ -22,6 +22,7 @@ import hashlib
 import time
 import sys
 from pathlib import Path
+import re
 
 # Import fetch_physical functions directly (instead of subprocess)
 try:
@@ -79,7 +80,7 @@ def read_raster_array_and_stats(path: str, nodata=None, max_dim: int = 2000):
 
 def raster_to_rgba_image(path: str, cmap_name: str,
                          vmin: Optional[float] = None, vmax: Optional[float] = None,
-                         nodata=None, max_dim: int = 2000):
+                         nodata=None, max_dim: int = 2000, overlay_style: str = "transparent"):
     arr, mask, v_auto_min, v_auto_max = read_raster_array_and_stats(path, nodata=nodata, max_dim=max_dim)
     vmin = vmin if vmin is not None else v_auto_min
     vmax = vmax if vmax is not None else v_auto_max
@@ -87,14 +88,36 @@ def raster_to_rgba_image(path: str, cmap_name: str,
     normed = np.clip(normed, 0, 1)
     cmap = matplotlib.colormaps.get_cmap(cmap_name)
     rgba = cmap(normed)
+    
+    # Apply different overlay styles
+    if overlay_style == "transparent":
+        # Make low values more transparent to preserve map labels
+        rgba[:, :, 3] = rgba[:, :, 3] * (0.3 + 0.7 * normed)  # Scale alpha based on data intensity
+    elif overlay_style == "contour":
+        # Create contour-like effect with transparency
+        rgba[:, :, 3] = np.where(normed > 0.3, rgba[:, :, 3] * 0.6, 0.0)
+    elif overlay_style == "multiply":
+        # Multiply blend mode simulation
+        rgba[:, :, 3] = 0.4  # Fixed lower opacity for multiply effect
+    
     rgba[mask, 3] = 0.0
     return (rgba * 255).astype("uint8"), (vmin, vmax)
 
-def add_image_overlay(m, img_rgba: np.ndarray, bounds, name: str, opacity: float = 0.7):
+def add_image_overlay(m, img_rgba: np.ndarray, bounds, name: str, opacity: float = 0.7, overlay_style: str = "transparent"):
+    # Adjust opacity based on overlay style
+    if overlay_style == "transparent":
+        adjusted_opacity = opacity * 0.6  # Reduce base opacity for transparent style
+    elif overlay_style == "contour":
+        adjusted_opacity = opacity * 0.8  # Higher opacity for contours
+    elif overlay_style == "multiply":
+        adjusted_opacity = opacity * 0.4  # Lower opacity for multiply blend
+    else:
+        adjusted_opacity = opacity
+    
     overlay = folium.raster_layers.ImageOverlay(
         image=img_rgba,
         bounds=[[bounds[0][0], bounds[0][1]], [bounds[1][0], bounds[1][1]]],
-        opacity=opacity,
+        opacity=adjusted_opacity,
         name=name,
         interactive=True,
         cross_origin=False,
@@ -476,7 +499,11 @@ if st.sidebar.button("Recompute flood_risk_0to1.tif", key="btn_recompute"):
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Display settings")
-overlay_opacity = st.sidebar.slider("Overlay opacity (visual only)", 0.0, 1.0, 0.65, 0.05, key="overlay_opacity")
+overlay_opacity = st.sidebar.slider("Overlay opacity (visual only)", 0.0, 1.0, 0.50, 0.05, key="overlay_opacity")
+overlay_style = st.sidebar.selectbox("Overlay style", 
+                                    options=["transparent", "contour", "multiply", "solid"],
+                                    index=0,
+                                    help="transparent: Variable transparency based on data intensity\ncontour: Highlight high-value areas\nmultiply: Lower opacity for blend effect\nsolid: Traditional overlay")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Layers to display")
@@ -628,32 +655,32 @@ def next_pos():
 # Overlays + legends
 if show_risk and "flood_risk_0to1" in paths and os.path.exists(paths["flood_risk_0to1"]):
     p = paths["flood_risk_0to1"]
-    img, (rvmin, rvmax) = raster_to_rgba_image(p, cmap_name=CMAPS["flood_risk_0to1"])
-    add_image_overlay(m, img, raster_bounds_latlon(p), "Flood risk (0–1)", opacity=overlay_opacity)
+    img, (rvmin, rvmax) = raster_to_rgba_image(p, cmap_name=CMAPS["flood_risk_0to1"], overlay_style=overlay_style)
+    add_image_overlay(m, img, raster_bounds_latlon(p), "Flood risk (0–1)", opacity=overlay_opacity, overlay_style=overlay_style)
     add_onmap_legend(m, make_continuous_legend_png(CMAPS["flood_risk_0to1"], rvmin, rvmax, "Flood risk (0–1)"), position=next_pos())
 
 if show_dist and "dist_to_river_m" in paths and os.path.exists(paths["dist_to_river_m"]):
     p = paths["dist_to_river_m"]
-    img, (dvmin, dvmax) = raster_to_rgba_image(p, cmap_name=CMAPS["dist_to_river_m"])
-    add_image_overlay(m, img, raster_bounds_latlon(p), "Distance to river (m)", opacity=overlay_opacity)
+    img, (dvmin, dvmax) = raster_to_rgba_image(p, cmap_name=CMAPS["dist_to_river_m"], overlay_style=overlay_style)
+    add_image_overlay(m, img, raster_bounds_latlon(p), "Distance to river (m)", opacity=overlay_opacity, overlay_style=overlay_style)
     add_onmap_legend(m, make_continuous_legend_png(CMAPS["dist_to_river_m"], dvmin, dvmax, "Distance to river (m)"), position=next_pos())
 
 if show_dd and "drainage_density_km_per_km2" in paths and os.path.exists(paths["drainage_density_km_per_km2"]):
     p = paths["drainage_density_km_per_km2"]
-    img, (ddvmin, ddvmax) = raster_to_rgba_image(p, cmap_name=CMAPS["drainage_density_km_per_km2"])
-    add_image_overlay(m, img, raster_bounds_latlon(p), "Drainage density (km/km²)", opacity=overlay_opacity)
+    img, (ddvmin, ddvmax) = raster_to_rgba_image(p, cmap_name=CMAPS["drainage_density_km_per_km2"], overlay_style=overlay_style)
+    add_image_overlay(m, img, raster_bounds_latlon(p), "Drainage density (km/km²)", opacity=overlay_opacity, overlay_style=overlay_style)
     add_onmap_legend(m, make_continuous_legend_png(CMAPS["drainage_density_km_per_km2"], ddvmin, ddvmax, "Drainage density (km/km²)"), position=next_pos())
 
 if show_soil and "soil_sand_pct" in paths and os.path.exists(paths["soil_sand_pct"]):
     p = paths["soil_sand_pct"]
-    img, (svmin, svmax) = raster_to_rgba_image(p, cmap_name=CMAPS["soil_sand_pct"])
-    add_image_overlay(m, img, raster_bounds_latlon(p), "Soil sand fraction (%)", opacity=overlay_opacity)
+    img, (svmin, svmax) = raster_to_rgba_image(p, cmap_name=CMAPS["soil_sand_pct"], overlay_style=overlay_style)
+    add_image_overlay(m, img, raster_bounds_latlon(p), "Soil sand fraction (%)", opacity=overlay_opacity, overlay_style=overlay_style)
     add_onmap_legend(m, make_continuous_legend_png(CMAPS["soil_sand_pct"], svmin, svmax, "Soil sand fraction (%)"), position=next_pos())
 
 if show_lulc and "lulc_worldcover_proxy" in paths and os.path.exists(paths["lulc_worldcover_proxy"]):
     p = paths["lulc_worldcover_proxy"]
-    img, _ = raster_to_rgba_image(p, cmap_name=CMAPS["lulc_worldcover_proxy"])
-    add_image_overlay(m, img, raster_bounds_latlon(p), "LULC (worldcover proxy)", opacity=overlay_opacity)
+    img, _ = raster_to_rgba_image(p, cmap_name=CMAPS["lulc_worldcover_proxy"], overlay_style=overlay_style)
+    add_image_overlay(m, img, raster_bounds_latlon(p), "LULC (worldcover proxy)", opacity=overlay_opacity, overlay_style=overlay_style)
     add_onmap_legend(m, make_lulc_legend_png(), position=next_pos())
 
 # Add a marker for any user-selected location and sample nearby values
