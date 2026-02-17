@@ -772,6 +772,16 @@ def main():
     wc_out = os.path.join(CFG.out_dir, "lulc_worldcover_proxy.tif")
     io_out = os.path.join(CFG.out_dir, "lulc_io_annual_proxy.tif")
     lulc_path, provider = fetch_worldcover_or_io_to_grid(bbox, transform, out_shape, wc_out, io_out, year=CFG.worldcover_year)
+    
+    # Apply boundary masking to LULC if boundary available
+    if boundary_geom is not None:
+        lulc_arr = None
+        with safe_rio_open(lulc_path) as src:
+            lulc_arr = src.read(1)
+        # Mask LULC to boundary (set outside to nodata=0)
+        lulc_arr = mask_raster_to_boundary(lulc_arr, transform, crs, boundary_geom, nodata=0)
+        # Save masked LULC
+        save_geotiff(lulc_path, lulc_arr, transform, crs, nodata=0, dtype="uint8")
 
     # Soil
     soil_raw = os.path.join(CFG.tmp_dir, "soil_sand_raw.tif")
@@ -802,6 +812,16 @@ def main():
                 dst_crs="EPSG:4326",
                 resampling=rasterio.warp.Resampling.bilinear,
             )
+    
+    # Apply boundary masking to soil if boundary available
+    if boundary_geom is not None:
+        soil_arr = None
+        with safe_rio_open(soil_path) as src:
+            soil_arr = src.read(1)
+        # Mask soil to boundary (set outside to nodata=0)
+        soil_arr = mask_raster_to_boundary(soil_arr, transform, crs, boundary_geom, nodata=0)
+        # Save masked soil
+        save_geotiff(soil_path, soil_arr, transform, crs, nodata=0, dtype=src.dtypes[0])
 
     outputs = {
         "dist_to_river_m": dist_path,
