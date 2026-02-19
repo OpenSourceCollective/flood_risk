@@ -332,53 +332,8 @@ def sample_raster_at_point(path: str, lat: float, lon: float):
     return None
 
 # ---------------- Sidebar ----------------
-
-# ---------------- Location search (top of sidebar)
-st.sidebar.subheader("Location search")
-st.sidebar.write("Enter an address/place name or `lat, lon` (decimal degrees).")
-# define the search action before widgets reference it
-def _do_loc_search():
-    q = st.session_state.get('loc_search_input', '').strip()
-    if not q:
-        st.session_state['loc_message'] = 'Enter a search query.'
-        return
-    parsed = parse_latlon(q)
-    if parsed:
-        lat, lon = parsed
-        st.session_state['selected_location'] = {'name': f'{lat:.6f}, {lon:.6f}', 'lat': lat, 'lon': lon}
-        st.session_state['loc_candidates'] = []
-        st.session_state['loc_message'] = f'Parsed coordinates: {lat:.6f}, {lon:.6f}'
-        return
-    if st.session_state.get('loc_use_geocode', True):
-        res = geocode_nominatim(q)
-        st.session_state['loc_candidates'] = res
-        if res:
-            st.session_state['selected_location'] = {'name': res[0]['name'], 'lat': res[0]['lat'], 'lon': res[0]['lon']}
-            st.session_state['loc_message'] = f'Found {len(res)} candidate(s). Selected the first.'
-        else:
-            st.session_state['loc_message'] = 'No geocoding results.'
-    else:
-        st.session_state['loc_message'] = 'Geocoding disabled and input is not lat,lon.'
-# text input (user types, then clicks Search)
-loc_query = st.sidebar.text_input('Search by address or "lat, lon"', placeholder='e.g., Lagos or 6.4285, 3.4795', key='loc_search_input')
-use_geocode = st.sidebar.checkbox('Use geocoding (Nominatim)', value=True, key='loc_use_geocode')
-st.sidebar.button('Search', on_click=_do_loc_search, key='loc_btn_go')
-
-if st.session_state.get('loc_candidates'):
-    candidates = st.session_state['loc_candidates']
-    labels = [f"{c['name']} ({c['lat']:.6f}, {c['lon']:.6f})" for c in candidates]
-    sel_idx = st.sidebar.selectbox('Choose candidate', list(range(len(labels))), format_func=lambda i: labels[i], key='loc_candidate_sel')
-    sel = candidates[sel_idx]
-    st.session_state['selected_location'] = {'name': sel['name'], 'lat': sel['lat'], 'lon': sel['lon']}
-
-if 'loc_message' in st.session_state:
-    st.sidebar.write(st.session_state.get('loc_message'))
-
-st.sidebar.divider()
-
-# ---------------- Layer controls... ----------------
-st.sidebar.title("Layers")
-summary_path = st.sidebar.text_input("Summary JSON path", value="data/rasters/prepared_layers_summary.json", key="summary_path_input")
+st.sidebar.markdown("---")
+summary_path = "data/rasters/prepared_layers_summary.json"
 if not os.path.exists(summary_path):
     st.error("Summary JSON not found. Run the fetch step first.")
     st.stop()
@@ -396,24 +351,17 @@ CMAPS = {
 }
 
 # Controls: toggles + WEIGHTS (replaces per-layer opacity sliders)
-st.sidebar.subheader("AOI / data refresh")
+st.sidebar.subheader("Flood risk index setup")
 # This is the PLACE NAME used to fetch rasters (OSM + landcover + soil). It is separate from the point "Location search" above.
 _default_aoi = meta.get("aoi_place", "Lagos, Nigeria") if isinstance(meta, dict) else "Lagos, Nigeria"
-aoi_place = st.sidebar.text_input("AOI place to fetch layers for", value=_default_aoi, key="aoi_place_input")
+aoi_place = st.sidebar.text_input("City to compute flood risk for (e.g. Lagos, Nigeria)", value=_default_aoi, key="aoi_place_input")
 fetch_first = st.sidebar.checkbox("Fetch physical layers before recompute", value=True, key="fetch_first")
 
-st.sidebar.subheader("Flood index weights (used to recompute flood_risk_0to1)")
+st.sidebar.subheader("Flood risk index weights")
 normalize_weights = st.sidebar.checkbox("Normalize weights to sum to 1", value=True, key="normalize_weights")
 
-# defaults: prefer weights stored in summary, else fall back
-w_defaults = {"dist": 0.35, "drainage": 0.25, "soil": 0.20, "lulc": 0.20}
-w_used = meta.get("flood_risk_weights_used", {})
-for k in w_defaults:
-    if k in w_used:
-        try:
-            w_defaults[k] = float(w_used[k])
-        except Exception:
-            pass
+# defaults: all weights equal at 0.25
+w_defaults = {"dist": 0.25, "drainage": 0.25, "soil": 0.25, "lulc": 0.25}
 
 w_dist = st.sidebar.slider("Weight: distance to waterways", 0.0, 1.0, float(w_defaults["dist"]), 0.01, key="w_dist")
 w_dd   = st.sidebar.slider("Weight: drainage density",      0.0, 1.0, float(w_defaults["drainage"]), 0.01, key="w_dd")
@@ -459,7 +407,7 @@ def _run_fetch_physical_direct(place: str) -> str:
     finally:
         sys.argv = orig_argv
 
-if st.sidebar.button("Recompute flood_risk_0to1.tif", key="btn_recompute"):
+if st.sidebar.button("Compute flood risk", key="btn_recompute"):
     try:
         # Determine if we need to fetch (AOI changed) or just recompute (weights changed)
         need_fetch = fetch_first and _aoi_changed()
@@ -524,11 +472,8 @@ if st.sidebar.button("Recompute flood_risk_0to1.tif", key="btn_recompute"):
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Display settings")
-overlay_opacity = st.sidebar.slider("Overlay opacity (visual only)", 0.0, 1.0, 0.50, 0.05, key="overlay_opacity")
-overlay_style = st.sidebar.selectbox("Overlay style", 
-                                    options=["transparent", "contour", "multiply", "solid"],
-                                    index=0,
-                                    help="transparent: Variable transparency based on data intensity\ncontour: Highlight high-value areas\nmultiply: Lower opacity for blend effect\nsolid: Traditional overlay")
+overlay_opacity = st.sidebar.slider("Overlay opacity", 0.0, 1.0, 0.50, 0.05, key="overlay_opacity")
+overlay_style = "solid"  # Fixed overlay style
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Layers to display")
@@ -540,135 +485,144 @@ show_lulc = st.sidebar.checkbox("LULC (worldcover proxy)", value=False, key="tog
 
 
 
-
-
-
 # --------------- Rainfall summary (above map) ----------------
+from datetime import datetime, timedelta
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def _load_meteorology_timeseries_cached(csv_path: str) -> Optional[pd.DataFrame]:
-    """Cached meteorology data loading. Avoids repeated CSV I/O and DataFrame operations.
-    Saves 0.5-2 seconds per render."""
-    return _load_meteorology_timeseries(csv_path)
-
-def _load_meteorology_timeseries(csv_path: str) -> Optional[pd.DataFrame]:
-    """Load meteorology_timeseries.csv and return a dataframe with columns: date, rainfall."""
-    if not csv_path:
+def _fetch_nasa_power_rainfall(lat: float, lon: float, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
+    """Fetch rainfall data from NASA POWER API for the given location and date range.
+    
+    Args:
+        lat: Latitude (decimal degrees)
+        lon: Longitude (decimal degrees)
+        start_date: Start date in YYYY-MM-DD format
+        end_date: End date in YYYY-MM-DD format
+    
+    Returns:
+        DataFrame with columns: date, rainfall (mm/day)
+    """
+    try:
+        # Convert dates to YYYYMMDD format for NASA POWER API
+        start_s = datetime.fromisoformat(start_date).strftime("%Y%m%d")
+        end_s = datetime.fromisoformat(end_date).strftime("%Y%m%d")
+        
+        url = (
+            "https://power.larc.nasa.gov/api/temporal/daily/point?"
+            f"parameters=PRECTOTCORR&community=AG&longitude={lon}&latitude={lat}"
+            f"&start={start_s}&end={end_s}&format=JSON"
+        )
+        
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        
+        # Extract precipitation data
+        prectot = data.get("properties", {}).get("parameter", {}).get("PRECTOTCORR", {})
+        
+        if not prectot:
+            return None
+        
+        # Convert to DataFrame
+        rows = []
+        for date_str, rainfall_val in sorted(prectot.items()):
+            try:
+                date_iso = datetime.strptime(date_str, "%Y%m%d").date().isoformat()
+                rainfall = float(rainfall_val)
+                if rainfall >= 0:  # Filter out missing data (usually -999)
+                    rows.append([date_iso, rainfall])
+            except (ValueError, TypeError):
+                continue
+        
+        if not rows:
+            return None
+        
+        df = pd.DataFrame(rows, columns=["date", "rainfall"])
+        df["date"] = pd.to_datetime(df["date"])
+        return df.sort_values("date")
+    
+    except Exception as e:
+        st.warning(f"Failed to fetch NASA POWER data: {e}")
         return None
-    # Try relative to script directory as well as current working dir
-    candidates = []
-    p = Path(csv_path)
-    candidates.append(p)
-    candidates.append(Path(__file__).resolve().parent / csv_path)
-    for cand in candidates:
-        try:
-            if cand.exists():
-                df = pd.read_csv(cand)
-                # Identify datetime column
-                cols_lower = {c: str(c).lower() for c in df.columns}
-                date_col = None
-                for c, cl in cols_lower.items():
-                    if "date" in cl or "time" in cl or "datetime" in cl or cl in ("dt", "timestamp"):
-                        date_col = c
-                        break
-                if date_col is None:
-                    date_col = df.columns[0]
-                df[date_col] = pd.to_datetime(df[date_col], errors="coerce", utc=False)
-                df = df.dropna(subset=[date_col]).copy()
-
-                # Identify rainfall / precip column
-                rain_col = None
-                for c, cl in cols_lower.items():
-                    if any(k in cl for k in ["rain", "rainfall", "precip", "precipitation", "prcp", "ppt"]):
-                        if c != date_col:
-                            rain_col = c
-                            break
-                if rain_col is None:
-                    # choose first numeric column that's not the date
-                    numeric_cols = [c for c in df.columns if c != date_col and pd.api.types.is_numeric_dtype(df[c])]
-                    if numeric_cols:
-                        rain_col = numeric_cols[0]
-
-                if rain_col is None:
-                    return None
-
-                out = df[[date_col, rain_col]].rename(columns={date_col: "date", rain_col: "rainfall"})
-                # Coerce rainfall to numeric (handles strings)
-                out["rainfall"] = pd.to_numeric(out["rainfall"], errors="coerce")
-                out = out.dropna(subset=["rainfall"])
-                return out.sort_values("date")
-        except Exception:
-            continue
-    return None
 
 @st.cache_data(ttl=600, show_spinner=False)
 def _quarterly_rainfall_average(df: pd.DataFrame) -> pd.DataFrame:
-    """Cached quarterly rainfall aggregation."""
+    """Cached quarterly rainfall aggregation - returns data for stacked bar chart by year."""
     d = df.copy()
-    d["quarter"] = d["date"].dt.to_period("Q").astype(str)
-    q = (d.groupby("quarter", as_index=False)["rainfall"].mean()
-           .rename(columns={"rainfall": "avg_rainfall"}))
-    return q
+    # Extract year and quarter
+    d["year"] = d["date"].dt.year
+    d["quarter_num"] = d["date"].dt.quarter
+    d["quarter"] = d["quarter_num"].map({1: "Q1 (Jan-Mar)", 2: "Q2 (Apr-Jun)", 
+                                          3: "Q3 (Jul-Sep)", 4: "Q4 (Oct-Dec)"})
+    
+    # Group by quarter and year, then pivot to get years as columns
+    q = d.groupby(["quarter", "year"], as_index=False)["rainfall"].mean()
+    # Pivot to get years as columns for stacking
+    q_pivot = q.pivot(index="quarter", columns="year", values="rainfall")
+    # Ensure quarters are in correct order
+    quarter_order = ["Q1 (Jan-Mar)", "Q2 (Apr-Jun)", "Q3 (Jul-Sep)", "Q4 (Oct-Dec)"]
+    q_pivot = q_pivot.reindex(quarter_order)
+    
+    return q_pivot
 
-# Sidebar control for meteorology csv
-st.sidebar.subheader("Rainfall time series")
-uploaded_csv = st.sidebar.file_uploader("Upload meterology_timeseries.csv (optional)", type=["csv"], key="met_csv")
-csv_path_input = st.sidebar.text_input("...or path to meterology_timeseries.csv", value="meterology_timeseries.csv", key="met_csv_path")
+# Sidebar control for meteorology data source
+st.sidebar.subheader("Rainfall data (NASA POWER API)")
 
 met_df = None
-if uploaded_csv is not None:
-    try:
-        met_df = pd.read_csv(uploaded_csv)
-        # normalize using loader logic by writing to temp dataframe-like pathless
-        # (reuse detection by wrapping)
-        tmp_path = None
-        cols_lower = {c: str(c).lower() for c in met_df.columns}
-        date_col = None
-        for c, cl in cols_lower.items():
-            if "date" in cl or "time" in cl or "datetime" in cl or cl in ("dt", "timestamp"):
-                date_col = c
-                break
-        if date_col is None:
-            date_col = met_df.columns[0]
-        met_df[date_col] = pd.to_datetime(met_df[date_col], errors="coerce", utc=False)
-        met_df = met_df.dropna(subset=[date_col]).copy()
 
-        rain_col = None
-        for c, cl in cols_lower.items():
-            if any(k in cl for k in ["rain", "rainfall", "precip", "precipitation", "prcp", "ppt"]):
-                if c != date_col:
-                    rain_col = c
-                    break
-        if rain_col is None:
-            numeric_cols = [c for c in met_df.columns if c != date_col and pd.api.types.is_numeric_dtype(met_df[c])]
-            if numeric_cols:
-                rain_col = numeric_cols[0]
-        if rain_col is not None:
-            met_df = met_df[[date_col, rain_col]].rename(columns={date_col: "date", rain_col: "rainfall"})
-            met_df["rainfall"] = pd.to_numeric(met_df["rainfall"], errors="coerce")
-            met_df = met_df.dropna(subset=["rainfall"]).sort_values("date")
+# Fetch from NASA POWER using AOI centroid
+bbox = meta.get("bbox", [0, 0, 0, 0])
+west, south, east, north = bbox
+center_lat = (south + north) / 2.0
+center_lon = (west + east) / 2.0
+
+# Date range controls
+col1, col2 = st.sidebar.columns(2)
+with col1:
+    # Default: last 3 years
+    default_start = (datetime.now() - timedelta(days=1095)).strftime("%Y-%m-%d")
+    start_date = st.date_input("Start date", value=datetime.fromisoformat(default_start), key="rain_start")
+with col2:
+    default_end = datetime.now().strftime("%Y-%m-%d")
+    end_date = st.date_input("End date", value=datetime.fromisoformat(default_end), key="rain_end")
+
+if st.sidebar.button("Fetch rainfall data", key="fetch_rainfall"):
+    with st.spinner("Fetching NASA POWER data..."):
+        met_df = _fetch_nasa_power_rainfall(
+            center_lat, center_lon,
+            start_date.isoformat(), end_date.isoformat()
+        )
+        if met_df is not None:
+            st.sidebar.success(f"✓ Fetched {len(met_df)} days of data")
         else:
-            met_df = None
-    except Exception:
-        met_df = None
+            st.sidebar.error("Failed to fetch data")
 else:
-    met_df = _load_meteorology_timeseries_cached(csv_path_input)
-
-# Render rainfall chart above the map (if data available)
-if met_df is not None and len(met_df) > 0:
-    qdf = _quarterly_rainfall_average(met_df)
-    st.subheader("Quarterly average rainfall")
-    st.caption("Computed from meterology_timeseries.csv (mean rainfall by calendar quarter).")
-    fig, ax = plt.subplots()
-    ax.bar(qdf["quarter"], qdf["avg_rainfall"])
-    ax.set_xlabel("Quarter")
-    ax.set_ylabel("Average rainfall")
-    ax.tick_params(axis="x", rotation=45)
-    st.pyplot(fig, use_container_width=True)
-else:
-    st.info("Rainfall chart: meterology_timeseries.csv not found or could not be parsed. Upload it in the sidebar or set the correct path.")
+    # Auto-fetch on first load (use cached data) - 3 years
+    met_df = _fetch_nasa_power_rainfall(
+        center_lat, center_lon,
+        (datetime.now() - timedelta(days=1095)).strftime("%Y-%m-%d"),
+        datetime.now().strftime("%Y-%m-%d")
+    )
 
 
 # --------------- Map Build ----------------
+
+# Flood risk explanation
+with st.expander("ℹ️ Understanding the Flood Risk Index", expanded=False):
+    st.markdown("""
+**Flood Risk Index (0-1):**  
+Composite score combining distance to water, drainage density, 
+soil permeability, and land cover.
+
+**Risk Categories:**
+- **0.0-0.3**: Low Risk  
+  Areas with good drainage, distance from water, and permeable surfaces
+- **0.3-0.6**: Moderate Risk  
+  Areas with mixed conditions; some vulnerability to flooding
+- **0.6-0.8**: High Risk  
+  Areas close to water, poor drainage, or impervious surfaces
+- **0.8-1.0**: Very High Risk  
+  Critical areas highly susceptible to flooding
+""")
 
 bbox = meta["bbox"]
 west, south, east, north = bbox
@@ -716,6 +670,8 @@ if show_lulc and "lulc_worldcover_proxy" in paths and os.path.exists(paths["lulc
     add_image_overlay(m, img, raster_bounds_latlon(p), "LULC (worldcover proxy)", opacity=overlay_opacity, overlay_style=overlay_style)
     add_onmap_legend(m, make_lulc_legend_png_cached(), position=next_pos())
 
+
+
 # Add a marker for any user-selected location and sample nearby values
 sel = st.session_state.get('selected_location') if 'selected_location' in st.session_state else None
 if sel:
@@ -754,5 +710,37 @@ if sel:
 folium.LayerControl(collapsed=False).add_to(m)
 st_folium(m, use_container_width=True, returned_objects=[])
 
-with st.expander("AOI details"):
-    st.write({"aoi_place": meta.get("aoi_place", "<unknown>"), "bbox": bbox})
+
+# --------------- Rainfall Chart (below map) ----------------
+if met_df is not None and len(met_df) > 0:
+    qdf = _quarterly_rainfall_average(met_df)
+    st.subheader("Quarterly average rainfall by year")
+    bbox = meta.get("bbox", [0, 0, 0, 0])
+    west, south, east, north = bbox
+    center_lat = (south + north) / 2.0
+    center_lon = (west + east) / 2.0
+    # Calculate date range for caption
+    date_range = f"{met_df['date'].min().strftime('%Y-%m-%d')} to {met_df['date'].max().strftime('%Y-%m-%d')}"
+    st.caption(f"NASA POWER data at AOI centroid ({center_lat:.4f}°N, {center_lon:.4f}°E) — {date_range}")
+    
+    # Create stacked bar chart
+    fig, ax = plt.subplots(figsize=(10, 5))
+    
+    # Define consistent color scheme for years (shades of blue)
+    years = qdf.columns.tolist()
+    # Use Blues colormap with adjusted range to avoid too light colors
+    colors = plt.cm.Blues(np.linspace(0.4, 0.9, len(years)))
+    
+    # Plot stacked bars
+    qdf.plot(kind='bar', stacked=True, ax=ax, color=colors, width=0.7)
+    
+    ax.set_xlabel("Quarter", fontsize=11)
+    ax.set_ylabel("Average rainfall (mm/day)", fontsize=11)
+    ax.set_xticklabels(qdf.index, rotation=0)
+    ax.legend(title="Year", bbox_to_anchor=(1.05, 1), loc='upper left', frameon=True)
+    ax.grid(axis='y', alpha=0.3, linestyle='--')
+    
+    plt.tight_layout()
+    st.pyplot(fig, use_container_width=True)
+else:
+    st.info("📊 Rainfall chart: Click 'Fetch rainfall data' in the sidebar to load data.")

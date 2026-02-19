@@ -1,10 +1,10 @@
 {
-  "aoi_place": "accra",
+  "aoi_place": "nairobi, kenya",
   "bbox": [
-    -0.3041318,
-    5.4971908,
-    -0.0348565,
-    5.6873682
+    36.6447016,
+    -1.4648822,
+    37.1248735,
+    -1.1406749
   ],
   "grid_res_deg": 0.001,
   "fishnet_cell_deg": 0.005,
@@ -26,10 +26,10 @@
     "drainage_density_km_per_km2": "Improved: smaller fishnet + optional Gaussian smoothing."
   },
   "flood_risk_weights_used": {
-    "dist": 0.35,
-    "drainage": 0.25,
-    "soil": 0.2,
-    "lulc": 0.2
+    "dist": 0.20569620253164556,
+    "drainage": 0.18987341772151897,
+    "soil": 0.30379746835443033,
+    "lulc": 0.30063291139240506
   },
   "lulc_key_used": "lulc_worldcover_proxy"
 }
