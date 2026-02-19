@@ -83,21 +83,8 @@ def add_image_overlay(m, img_rgba: np.ndarray, bounds, name: str, opacity: float
     overlay.add_to(m)
 
 def make_continuous_legend_png(cmap_name: str, vmin: float, vmax: float, title: str, width_px=260) -> bytes:
-    # Convert numpy RGBA array to PIL Image with proper alpha channel preservation
-    pil_img = Image.fromarray(img_rgba, mode='RGBA')
-    
-    # Encode to PNG bytes (preserves alpha/transparency)
-    bio = BytesIO()
-    pil_img.save(bio, format='PNG')
-    bio.seek(0)
-    png_data = bio.getvalue()
-    
-    # Encode as base64 data URI for folium
-    b64_png = base64.b64encode(png_data).decode('utf-8')
-    img_url = f"data:image/png;base64,{b64_png}"
-    
-    overlay = folium.raster_layers.ImageOverlay(
-        image=img_urlt(bottom=0.35, top=0.85, left=0.08, right=0.98)
+    fig, ax = plt.subplots(figsize=(4.0, 1.0), dpi=200)
+    fig.subplots_adjust(bottom=0.35, top=0.85, left=0.08, right=0.98)
     cmap = matplotlib.colormaps.get_cmap(cmap_name)
     norm = matplotlib.colors.Normalize(vmin=vmin, vmax=vmax)
     cb = matplotlib.colorbar.ColorbarBase(ax, cmap=cmap, norm=norm, orientation="horizontal")
@@ -169,7 +156,10 @@ def run_fetch_physical(place_name):
         
         try:
             # Set up arguments for fetch_physical
-            sys.argv = ["fetch_physical.py", "--place", place_name, "--auto-fetch-boundary"]
+            # Use skip flags for speed: only re-fetch if you explicitly want new data
+            # Use --fetch-boundary to apply city boundary masking
+            sys.argv = ["fetch_physical.py", "--place", place_name, "--fetch-boundary", 
+                        "--skip-water", "--skip-lulc", "--skip-soil"]
             
             # Import and run fetch_physical.main()
             from fetch_physical import main as fetch_main

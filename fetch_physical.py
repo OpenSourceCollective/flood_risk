@@ -26,6 +26,7 @@ import os, sys, math, json, warnings, argparse
 from dataclasses import dataclass
 from typing import Tuple
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import geopandas as gpd
@@ -663,15 +664,22 @@ def parse_args():
     ap.add_argument("--soil-res-m", type=int, default=CFG.soil_res_m)
     ap.add_argument("--smooth-sigma", type=float, default=CFG.smooth_drainage_sigma)
     ap.add_argument("--worldcover-year", type=int, default=CFG.worldcover_year)
-    ap.add_argument("--auto-fetch-boundary", action="store_true", default=True,
-                    help="Auto-fetch city boundary if missing or is a bbox (default: enabled)")
-    ap.add_argument("--no-auto-fetch-boundary", dest="auto_fetch_boundary", action="store_false",
-                    help="Disable auto-fetch of city boundary")
+    ap.add_argument("--fetch-boundary", action="store_true", default=False,
+                    help="Fetch city boundary from OSM (slower, more accurate). Default: skip for speed")
     ap.add_argument("--boundary-fetch-feedback", action="store_true", default=False,
                     help="Show detailed feedback during boundary fetch (for debugging)")
+    ap.add_argument("--skip-water", action="store_true", default=False,
+                    help="Skip OSM waterway fetch if dist_to_river_m.tif exists. Default: re-fetch")
+    ap.add_argument("--skip-lulc", action="store_true", default=False,
+                    help="Skip LULC fetch if *_proxy.tif exists. Default: re-fetch")
+    ap.add_argument("--skip-soil", action="store_true", default=False,
+                    help="Skip SoilGrids fetch if soil_sand_pct.tif exists. Default: re-fetch")
     return ap.parse_args()
 
 def main():
+    import time
+    total_start = time.time()
+    
     args = parse_args()
     CFG.place_name = args.place
     CFG.grid_res_deg = float(args.grid_res_deg)
@@ -685,123 +693,131 @@ def main():
     crs = CRS.from_epsg(CFG.crs_epsg)
 
     print("=== Fetch & Prepare Layers (improved) ===")
+    print(f"[fetch] Geocoding AOI: {CFG.place_name}")
     aoi = geocode_aoi(CFG.place_name)
     bbox = bbox_from_gdf(aoi, buffer_deg=CFG.buffer_deg)
-    print(f"  Analysis bbox: {bbox}")
+    print(f"[fetch]   Analysis bbox: {bbox}")
     
-    # Auto-fetch city boundary if enabled
+    # Auto-fetch city boundary if explicitly requested
     boundary_geom = None
-    if args.auto_fetch_boundary:
-        print(f"[INFO] Loading or fetching city boundary for masking...")
-        boundary_geom = load_city_boundary()
-
-        # Also try to read the saved boundary file to determine which place it represents
-        saved_place_name = None
+    if args.fetch_boundary:
+        print(f"[fetch] Fetching city boundary from OSM...")
+        start = time.time()
         try:
-            if os.path.exists("data/city_boundary.geojson"):
-                saved_gdf = gpd.read_file("data/city_boundary.geojson")
-                if not saved_gdf.empty and "name" in saved_gdf.columns:
-                    saved_place_name = str(saved_gdf["name"].iloc[0])
-        except Exception:
-            saved_place_name = None
-
-        # Check if boundary is missing, is just the AOI bbox (placeholder),
-        # or represents a different place than requested. In any of these
-        # cases we should attempt to auto-fetch.
-        try:
-            need_fetch = False
-            if boundary_geom is None:
-                need_fetch = True
+            fetched = fetch_and_save_city_boundary(
+                bbox, CFG.place_name, max_retries=1, show_feedback=args.boundary_fetch_feedback
+            )
+            if fetched is not None:
+                boundary_geom = load_city_boundary()
+                elapsed = time.time() - start
+                print(f"[fetch]   Boundary fetched in {elapsed:.1f}s")
             else:
-                # If the saved boundary has a `name` and it differs from the
-                # requested place, force a refetch so we don't reuse another
-                # city's polygon (e.g., Nairobi when requesting Lagos).
-                if saved_place_name and saved_place_name.strip().lower() != CFG.place_name.strip().lower():
-                    need_fetch = True
-                    if args.boundary_fetch_feedback:
-                        print(f"[INFO] Detected saved boundary for '{saved_place_name}'; requested '{CFG.place_name}' -> refetching...")
-                else:
-                    # Compare boundary bounds to analysis bbox; if they match closely,
-                    # the boundary is likely just a bbox placeholder.
-                    bminx, bminy, bmaxx, bmaxy = boundary_geom.bounds
-                    tol = max(1e-6, CFG.grid_res_deg * 2)
-                    if (abs(bminx - bbox[0]) <= tol and abs(bminy - bbox[1]) <= tol and
-                        abs(bmaxx - bbox[2]) <= tol and abs(bmaxy - bbox[3]) <= tol):
-                        need_fetch = True
-                        if args.boundary_fetch_feedback:
-                            print(f"[INFO] Detected bbox placeholder boundary; fetching real polygon...")
-
-            if need_fetch:
-                if args.boundary_fetch_feedback:
-                    print(f"[INFO] Attempting to fetch actual city boundary from OSM (auto)...")
-                fetched = fetch_and_save_city_boundary(
-                    bbox, CFG.place_name, max_retries=2, show_feedback=args.boundary_fetch_feedback
-                )
-                if fetched is not None:
-                    # reload geometry
-                    boundary_geom = load_city_boundary()
-                else:
-                    if args.boundary_fetch_feedback:
-                        print("[WARNING] Auto-fetch failed; continuing without polygon masking.")
+                print("[fetch] [WARNING] Could not fetch boundary; continuing without masking.")
         except Exception as e:
-            if args.boundary_fetch_feedback:
-                print(f"[WARNING] Exception while auto-fetching boundary: {e}")
+            print(f"[fetch] [WARNING] Exception during boundary fetch: {e}")
+    else:
+        # Try to load existing boundary if available, but don't fetch
+        boundary_geom = load_city_boundary()
+        if boundary_geom is not None:
+            print(f"[fetch] Using existing city boundary")
+        else:
+            print(f"[fetch] Skipping boundary fetch (use --fetch-boundary to enable)")
+    
     
     transform, out_shape = make_raster_grid_from_bbox(bbox, CFG.grid_res_deg)
 
-    # Water features
-    water_lines, water_polys = fetch_osm_waterways_and_waterpolys(bbox)
-
-    dist = compute_distance_to_water_raster(water_lines, water_polys, transform, out_shape, grid_res_deg=CFG.grid_res_deg)
-    if boundary_geom is not None:
-        # Mask distance raster to city boundary
-        dist = mask_raster_to_boundary(dist, transform, crs, boundary_geom, nodata=np.nan)
+    # Water features - skip if file exists and --skip-water flag set
     dist_path = os.path.join(CFG.out_dir, "dist_to_river_m.tif")
-    save_geotiff(dist_path, dist, transform, crs, nodata=np.nan, dtype="float32")
-
-    dd_grid = compute_drainage_density_grid(water_lines, bbox, CFG.fishnet_cell_deg)
-    dd = rasterize_grid_values(dd_grid, "dd_km_per_km2", transform, out_shape)
-    dd = smooth_raster(dd, CFG.smooth_drainage_sigma)
-    if boundary_geom is not None:
-        # Mask drainage raster to city boundary
-        dd = mask_raster_to_boundary(dd, transform, crs, boundary_geom, nodata=0.0)
     dd_path = os.path.join(CFG.out_dir, "drainage_density_km_per_km2.tif")
-    save_geotiff(dd_path, dd, transform, crs, nodata=0.0, dtype="float32")
+    
+    if args.skip_water and os.path.exists(dist_path) and os.path.exists(dd_path):
+        print(f"[fetch] Skipping water layer (--skip-water + files exist)")
+    else:
+        print(f"[fetch] Fetching OSM waterways...")
+        start = time.time()
+        water_lines, water_polys = fetch_osm_waterways_and_waterpolys(bbox)
+        elapsed = time.time() - start
+        print(f"[fetch]   Water fetched in {elapsed:.1f}s")
 
-    # LULC
+        dist = compute_distance_to_water_raster(water_lines, water_polys, transform, out_shape, grid_res_deg=CFG.grid_res_deg)
+        save_geotiff(dist_path, dist, transform, crs, nodata=np.nan, dtype="float32")
+        print(f"[fetch]   Saved {dist_path}")
+
+        dd_grid = compute_drainage_density_grid(water_lines, bbox, CFG.fishnet_cell_deg)
+        dd = rasterize_grid_values(dd_grid, "dd_km_per_km2", transform, out_shape)
+        dd = smooth_raster(dd, CFG.smooth_drainage_sigma)
+        save_geotiff(dd_path, dd, transform, crs, nodata=0.0, dtype="float32")
+        print(f"[fetch]   Saved {dd_path}")
+
+    # LULC - skip if file exists and --skip-lulc flag set
     wc_out = os.path.join(CFG.out_dir, "lulc_worldcover_proxy.tif")
     io_out = os.path.join(CFG.out_dir, "lulc_io_annual_proxy.tif")
-    lulc_path, provider = fetch_worldcover_or_io_to_grid(bbox, transform, out_shape, wc_out, io_out, year=CFG.worldcover_year)
-
-    # Soil
-    soil_raw = os.path.join(CFG.tmp_dir, "soil_sand_raw.tif")
-    download_soilgrids_bbox(bbox, soil_raw, coverage="sand_0-5cm_Q0.5", res_m=CFG.soil_res_m)
-
     soil_path = os.path.join(CFG.out_dir, "soil_sand_pct.tif")
-    import rasterio.warp
-    print(f"[DEBUG] Opening SoilGrids raster: {soil_raw}")
-    with safe_rio_open(soil_raw) as src:
-        profile = {
-            "driver": "GTiff",
-            "height": out_shape[0],
-            "width": out_shape[1],
-            "count": 1,
-            "dtype": src.dtypes[0],
-            "crs": "EPSG:4326",
-            "transform": transform,
-            "compress": "deflate",
-            "nodata": None,
-        }
-        with safe_rio_open(soil_path, "w", **profile) as dst:
-            rasterio.warp.reproject(
-                source=rasterio.band(src, 1),
-                destination=rasterio.band(dst, 1),
-                src_transform=src.transform,
-                src_crs=src.crs,
-                dst_transform=transform,
-                dst_crs="EPSG:4326",
-                resampling=rasterio.warp.Resampling.bilinear,
-            )
+    soil_raw = os.path.join(CFG.tmp_dir, "soil_sand_raw.tif")
+    
+    lulc_path, provider = None, None
+    soil_raw_result = None
+    
+    # Parallel download: LULC + SoilGrids simultaneously
+    def fetch_lulc_task():
+        if args.skip_lulc and (os.path.exists(wc_out) or os.path.exists(io_out)):
+            print(f"[fetch] Skipping LULC (--skip-lulc + file exists)")
+            if os.path.exists(wc_out):
+                return wc_out, "ESA WorldCover"
+            else:
+                return io_out, "IO Annual"
+        else:
+            print(f"[fetch] Fetching LULC data...")
+            return fetch_worldcover_or_io_to_grid(bbox, transform, out_shape, wc_out, io_out, year=CFG.worldcover_year)
+    
+    def fetch_soil_task():
+        if args.skip_soil and os.path.exists(soil_path):
+            print(f"[fetch] Skipping soil layer (--skip-soil + file exists)")
+            return soil_raw
+        else:
+            print(f"[fetch] Fetching SoilGrids data...")
+            download_soilgrids_bbox(bbox, soil_raw, coverage="sand_0-5cm_Q0.5", res_m=CFG.soil_res_m)
+            return soil_raw
+    
+    print(f"[fetch] Starting parallel LULC + SoilGrids downloads...")
+    parallel_start = time.time()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        lulc_future = executor.submit(fetch_lulc_task)
+        soil_future = executor.submit(fetch_soil_task)
+        
+        # Wait for both to complete
+        lulc_path, provider = lulc_future.result()
+        soil_raw_result = soil_future.result()
+    
+    parallel_elapsed = time.time() - parallel_start
+    print(f"[fetch]   Parallel downloads completed in {parallel_elapsed:.1f}s")
+    
+    # Reproject soil to analysis grid (after parallel downloads complete)
+    if not (args.skip_soil and os.path.exists(soil_path)):
+        print(f"[fetch]   Reprojecting SoilGrids to analysis grid...")
+        import rasterio.warp
+        with safe_rio_open(soil_raw_result) as src:
+            profile = {
+                "driver": "GTiff",
+                "height": out_shape[0],
+                "width": out_shape[1],
+                "count": 1,
+                "dtype": src.dtypes[0],
+                "crs": "EPSG:4326",
+                "transform": transform,
+                "compress": "deflate",
+                "nodata": None,
+            }
+            with safe_rio_open(soil_path, "w", **profile) as dst:
+                rasterio.warp.reproject(
+                    source=rasterio.band(src, 1),
+                    destination=rasterio.band(dst, 1),
+                    src_transform=src.transform,
+                    src_crs=src.crs,
+                    dst_transform=transform,
+                    dst_crs="EPSG:4326",
+                    resampling=rasterio.warp.Resampling.bilinear,
+                )
 
     outputs = {
         "dist_to_river_m": dist_path,
@@ -835,8 +851,9 @@ def main():
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
-    print(f"Wrote: {summary_path}")
-    print("=== Done ===")
+    print(f"[fetch] Wrote: {summary_path}")
+    total_elapsed = time.time() - total_start
+    print(f"[fetch] === Done (total: {total_elapsed:.1f}s) ===")
 
 if __name__ == "__main__":
     try:

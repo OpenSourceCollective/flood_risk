@@ -7,6 +7,8 @@ import json, os, base64
 from typing import Optional, Tuple
 import numpy as np
 import rasterio
+import rasterio.mask
+from rasterio.features import geometry_mask
 import matplotlib
 import matplotlib.pyplot as plt
 from io import BytesIO
@@ -23,6 +25,7 @@ import time
 import sys
 from pathlib import Path
 import re
+import geopandas as gpd
 
 # Import fetch_physical functions directly (instead of subprocess)
 try:
@@ -44,6 +47,81 @@ st.set_page_config(page_title="Flood Risk Viewer", layout="wide")
 def read_summary(summary_path: str) -> dict:
     with open(summary_path, "r") as f:
         return json.load(f)
+
+def load_city_boundary(boundary_path: str = "data/city_boundary.geojson") -> Optional:
+    """Load city boundary GeoJSON and return the geometry (no caching - always reload)."""
+    try:
+        p = Path(boundary_path)
+        if not p.exists():
+            print(f"[DEBUG] Boundary file not found: {boundary_path}")
+            return None
+        gdf = gpd.read_file(str(p))
+        if gdf.empty:
+            print(f"[DEBUG] Boundary file is empty")
+            return None
+        # Get first geometry (assume single feature or multipart)
+        geom = gdf.geometry.iloc[0]
+        print(f"[DEBUG] Loaded boundary geometry: {geom.geom_type}, bounds: {geom.bounds}")
+        return geom
+    except Exception as e:
+        print(f"[WARNING] Could not load boundary: {e}")
+        return None
+
+def apply_boundary_mask_to_rgba(rgba_array: np.ndarray, raster_path: str, 
+                                boundary_geom, crs: str = "EPSG:4326") -> np.ndarray:
+    """Apply boundary geometry mask to RGBA array for visualization only."""
+    if boundary_geom is None:
+        return rgba_array
+    
+    try:
+        from rasterio.features import geometry_mask
+        # Read raster to get transform and data shape
+        with rasterio.open(raster_path) as src:
+            # Calculate the transform for the downsampled array (if it was downsampled)
+            # The rgba_array might be smaller than the full raster due to max_dim downsampling
+            rgba_height, rgba_width = rgba_array.shape[0], rgba_array.shape[1]
+            src_height, src_width = src.height, src.width
+            
+            # If shapes match, use the source transform directly
+            if rgba_height == src_height and rgba_width == src_width:
+                scale_x = scale_y = 1.0
+                use_transform = src.transform
+            else:
+                # Calculate scale factors if downsampled
+                scale_x = src_width / rgba_width
+                scale_y = src_height / rgba_height
+                # Adjust transform for downsampled resolution
+                from rasterio.transform import Affine
+                use_transform = Affine(
+                    src.transform.a * scale_x,  # pixel width
+                    src.transform.b,
+                    src.transform.c,
+                    src.transform.d,
+                    src.transform.e * scale_y,  # pixel height
+                    src.transform.f
+                )
+            
+            # Create binary mask at the same resolution as rgba_array
+            mask_array = geometry_mask([boundary_geom], 
+                                      out_shape=(rgba_height, rgba_width),
+                                      transform=use_transform,
+                                      invert=False)  # False = True inside boundary
+            
+            # Count pixels being masked
+            masked_pixels = np.sum(~mask_array)
+            total_pixels = mask_array.shape[0] * mask_array.shape[1]
+            
+            # Apply to alpha channel: set alpha to 0 outside boundary
+            # mask_array is True inside boundary, False outside
+            # Set alpha to 0 where mask is False (outside boundary)
+            rgba_array[mask_array, 3] = 0  # Set alpha to 0 outside boundary
+            print(f"[DEBUG] Applied boundary mask: {masked_pixels}/{total_pixels} pixels ({100*masked_pixels/total_pixels:.1f}%) outside boundary")
+    except Exception as e:
+        print(f"[WARNING] Could not apply boundary mask: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    return rgba_array
 
 def raster_bounds_latlon(path: str) -> Tuple[Tuple[float, float], Tuple[float, float]]:
     with rasterio.open(path) as src:
@@ -80,7 +158,8 @@ def read_raster_array_and_stats(path: str, nodata=None, max_dim: int = 2000):
 
 def raster_to_rgba_image(path: str, cmap_name: str,
                          vmin: Optional[float] = None, vmax: Optional[float] = None,
-                         nodata=None, max_dim: int = 2000, overlay_style: str = "transparent"):
+                         nodata=None, max_dim: int = 2000, overlay_style: str = "transparent",
+                         boundary_geom=None):
     arr, mask, v_auto_min, v_auto_max = read_raster_array_and_stats(path, nodata=nodata, max_dim=max_dim)
     vmin = vmin if vmin is not None else v_auto_min
     vmax = vmax if vmax is not None else v_auto_max
@@ -101,6 +180,11 @@ def raster_to_rgba_image(path: str, cmap_name: str,
         rgba[:, :, 3] = 0.4  # Fixed lower opacity for multiply effect
     
     rgba[mask, 3] = 0.0
+    
+    # Apply boundary masking for visualization only (if boundary provided)
+    if boundary_geom is not None:
+        rgba = apply_boundary_mask_to_rgba(rgba, path, boundary_geom)
+    
     return (rgba * 255).astype("uint8"), (vmin, vmax)
 
 def add_image_overlay(m, img_rgba: np.ndarray, bounds, name: str, opacity: float = 0.7, overlay_style: str = "transparent"):
@@ -431,7 +515,8 @@ def _run_fetch_physical_direct(place: str) -> str:
     # Save original sys.argv and replace with fetch_physical arguments
     orig_argv = sys.argv
     try:
-        sys.argv = ["fetch_physical.py", "--place", place]
+        # Include --fetch-boundary to get the city boundary for visualization masking
+        sys.argv = ["fetch_physical.py", "--place", place, "--fetch-boundary"]
         # Call main() directly
         fetch_physical_main()
         return f"✓ Fetched layers for: {place}"
@@ -643,6 +728,16 @@ center_lat = (south + north) / 2.0
 center_lon = (west + east) / 2.0
 m = folium.Map(location=[center_lat, center_lon], zoom_start=11, tiles="CartoDB positron")
 
+# Load city boundary for visualization masking
+boundary_geom = load_city_boundary("data/city_boundary.geojson")
+if boundary_geom is not None:
+    st.sidebar.success(f"✓ City boundary loaded for visualization masking (geom type: {boundary_geom.geom_type})")
+    print(f"[DEBUG] Boundary geometry bounds: {boundary_geom.bounds}")
+    print(f"[DEBUG] Raster bbox: {bbox}")
+else:
+    st.sidebar.info("ℹ City boundary not found (visualization will show rectangular extent)")
+    print("[DEBUG] City boundary is None")
+
 # Legend positions cycle
 legend_positions = ["bottomright", "bottomleft", "topright", "topleft"]
 legend_idx = 0
@@ -655,31 +750,31 @@ def next_pos():
 # Overlays + legends
 if show_risk and "flood_risk_0to1" in paths and os.path.exists(paths["flood_risk_0to1"]):
     p = paths["flood_risk_0to1"]
-    img, (rvmin, rvmax) = raster_to_rgba_image(p, cmap_name=CMAPS["flood_risk_0to1"], overlay_style=overlay_style)
+    img, (rvmin, rvmax) = raster_to_rgba_image(p, cmap_name=CMAPS["flood_risk_0to1"], overlay_style=overlay_style, boundary_geom=boundary_geom)
     add_image_overlay(m, img, raster_bounds_latlon(p), "Flood risk (0–1)", opacity=overlay_opacity, overlay_style=overlay_style)
     add_onmap_legend(m, make_continuous_legend_png(CMAPS["flood_risk_0to1"], rvmin, rvmax, "Flood risk (0–1)"), position=next_pos())
 
 if show_dist and "dist_to_river_m" in paths and os.path.exists(paths["dist_to_river_m"]):
     p = paths["dist_to_river_m"]
-    img, (dvmin, dvmax) = raster_to_rgba_image(p, cmap_name=CMAPS["dist_to_river_m"], overlay_style=overlay_style)
+    img, (dvmin, dvmax) = raster_to_rgba_image(p, cmap_name=CMAPS["dist_to_river_m"], overlay_style=overlay_style, boundary_geom=boundary_geom)
     add_image_overlay(m, img, raster_bounds_latlon(p), "Distance to river (m)", opacity=overlay_opacity, overlay_style=overlay_style)
     add_onmap_legend(m, make_continuous_legend_png(CMAPS["dist_to_river_m"], dvmin, dvmax, "Distance to river (m)"), position=next_pos())
 
 if show_dd and "drainage_density_km_per_km2" in paths and os.path.exists(paths["drainage_density_km_per_km2"]):
     p = paths["drainage_density_km_per_km2"]
-    img, (ddvmin, ddvmax) = raster_to_rgba_image(p, cmap_name=CMAPS["drainage_density_km_per_km2"], overlay_style=overlay_style)
+    img, (ddvmin, ddvmax) = raster_to_rgba_image(p, cmap_name=CMAPS["drainage_density_km_per_km2"], overlay_style=overlay_style, boundary_geom=boundary_geom)
     add_image_overlay(m, img, raster_bounds_latlon(p), "Drainage density (km/km²)", opacity=overlay_opacity, overlay_style=overlay_style)
     add_onmap_legend(m, make_continuous_legend_png(CMAPS["drainage_density_km_per_km2"], ddvmin, ddvmax, "Drainage density (km/km²)"), position=next_pos())
 
 if show_soil and "soil_sand_pct" in paths and os.path.exists(paths["soil_sand_pct"]):
     p = paths["soil_sand_pct"]
-    img, (svmin, svmax) = raster_to_rgba_image(p, cmap_name=CMAPS["soil_sand_pct"], overlay_style=overlay_style)
+    img, (svmin, svmax) = raster_to_rgba_image(p, cmap_name=CMAPS["soil_sand_pct"], overlay_style=overlay_style, boundary_geom=boundary_geom)
     add_image_overlay(m, img, raster_bounds_latlon(p), "Soil sand fraction (%)", opacity=overlay_opacity, overlay_style=overlay_style)
     add_onmap_legend(m, make_continuous_legend_png(CMAPS["soil_sand_pct"], svmin, svmax, "Soil sand fraction (%)"), position=next_pos())
 
 if show_lulc and "lulc_worldcover_proxy" in paths and os.path.exists(paths["lulc_worldcover_proxy"]):
     p = paths["lulc_worldcover_proxy"]
-    img, _ = raster_to_rgba_image(p, cmap_name=CMAPS["lulc_worldcover_proxy"], overlay_style=overlay_style)
+    img, _ = raster_to_rgba_image(p, cmap_name=CMAPS["lulc_worldcover_proxy"], overlay_style=overlay_style, boundary_geom=boundary_geom)
     add_image_overlay(m, img, raster_bounds_latlon(p), "LULC (worldcover proxy)", opacity=overlay_opacity, overlay_style=overlay_style)
     add_onmap_legend(m, make_lulc_legend_png(), position=next_pos())
 

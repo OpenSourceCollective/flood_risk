@@ -76,12 +76,17 @@ def run(summary_path, w_dist=0.35, w_drainage=0.25, w_soil=0.20, w_lulc=0.20,
 
     If normalize_weights=True, weights are scaled to sum to 1 (useful when sliders are changed).
     """
+    import time
+    start_time = time.time()
+    
+    print("[recompute] Loading summary...")
     with open(summary_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
     p = meta.get("outputs", {})
 
     lulc_key = _pick_lulc_key(p)
 
+    print("[recompute] Loading rasters...")
     with rasterio.open(p["dist_to_river_m"]) as src:
         dist = src.read(1); transform = src.transform; crs = src.crs
     with rasterio.open(p["drainage_density_km_per_km2"]) as src:
@@ -90,6 +95,9 @@ def run(summary_path, w_dist=0.35, w_drainage=0.25, w_soil=0.20, w_lulc=0.20,
         soil = src.read(1)
     with rasterio.open(p[lulc_key]) as src:
         lulc = src.read(1)
+    
+    load_time = time.time() - start_time
+    print(f"[recompute] Rasters loaded ({load_time:.2f}s)")
 
     weights = {"dist": float(w_dist), "drainage": float(w_drainage),
                "soil": float(w_soil), "lulc": float(w_lulc)}
@@ -99,9 +107,16 @@ def run(summary_path, w_dist=0.35, w_drainage=0.25, w_soil=0.20, w_lulc=0.20,
         if s > 0:
             weights = {k: v/s for k, v in weights.items()}
 
+    print(f"[recompute] Computing risk with weights: {weights}...")
+    compute_time = time.time()
     risk01 = compute_risk(dist, dd, soil, lulc, weights)
+    compute_elapsed = time.time() - compute_time
+    print(f"[recompute] Risk computed ({compute_elapsed:.2f}s)")
 
     out_path = out_path_override or os.path.join(os.path.dirname(summary_path), "flood_risk_0to1.tif")
+    
+    print(f"[recompute] Saving to {out_path}...")
+    save_time = time.time()
     profile = {
         "driver": "GTiff",
         "height": risk01.shape[0],
@@ -115,7 +130,10 @@ def run(summary_path, w_dist=0.35, w_drainage=0.25, w_soil=0.20, w_lulc=0.20,
     }
     with rasterio.open(out_path, "w", **profile) as dst:
         dst.write(risk01.astype("float32"), 1)
+    save_elapsed = time.time() - save_time
+    print(f"[recompute] Saved ({save_elapsed:.2f}s)")
 
+    print("[recompute] Updating metadata...")
     meta.setdefault("outputs", {})
     meta["outputs"]["flood_risk_0to1"] = out_path
     meta["flood_risk_weights_used"] = weights
@@ -124,6 +142,8 @@ def run(summary_path, w_dist=0.35, w_drainage=0.25, w_soil=0.20, w_lulc=0.20,
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
+    total_time = time.time() - start_time
+    print(f"[recompute] Total time: {total_time:.2f}s")
     print(f"Saved flood risk: {out_path}")
     print(f"Updated summary: {summary_path}")
     return out_path, weights
