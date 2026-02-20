@@ -1,0 +1,41 @@
+# Build artifacts
+build/
+dist/
+packaging/
+
+# PyInstaller
+*.spec.bak
+*.egg-info/
+*.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data & Cache
+cache/
+*.csv
+*.tif
+*.tiff
+*.geojson
+
+# Logs
+logs/
