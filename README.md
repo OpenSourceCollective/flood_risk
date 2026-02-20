@@ -17,18 +17,18 @@ Flood exposure is growing in many cities, yet high‑quality risk maps can be sl
 ## How it works
 
 1. **Fetch physical layers** using [fetch_physical.py](fetch_physical.py):
-	- Waterways + inland water bodies from OpenStreetMap (OSMnx)
-	- Soil sand percentage from SoilGrids WCS
-	- Land‑cover from ESA WorldCover or IO LULC (Planetary Computer)
-	- Drainage density from OSM waterway length per grid cell
+   - Waterways + inland water bodies from OpenStreetMap (OSMnx)
+   - Soil sand percentage from SoilGrids WCS
+   - Land‑cover from ESA WorldCover or IO LULC (Planetary Computer)
+   - Drainage density from OSM waterway length per grid cell
 2. **Compute flood risk** with [flood_risk_compute.py](flood_risk_compute.py):
-	- Normalizes each layer (robust min‑max)
-	- Inverts distance‑to‑water and soil sand (less infiltration = higher risk)
-	- Combines layers into a 0–1 raster using weights
+   - Normalizes each layer (robust min‑max)
+   - Inverts distance‑to‑water and soil sand (less infiltration = higher risk)
+   - Combines layers into a 0–1 raster using weights
 3. **Explore in UI** with [ui.py](ui.py):
-	- Live recompute with weight sliders
-	- Overlay legends for each layer
-	- Location search + nearest grid lookup
+   - Live recompute with weight sliders
+   - Overlay legends for each layer
+   - Location search + nearest grid lookup
 
 Outputs are stored in data/rasters and summarized in data/rasters/prepared_layers_summary.json.
 
@@ -65,10 +65,20 @@ streamlit run ui.py
 
 - Optional
 
-    - Fetch meteorology data with 'python3 fetch_metrology.py --start 2023-01-01 --end 2024-12-31'
+  - Fetch meteorology data with `python3 fetch_metrology.py --start 2023-01-01 --end 2024-12-31`
+  - Fetch physical layers and build rasters with `python3 fetch_physical.py --place "Lagos, Nigeria"`
+  - Compute flood risk with already fetched layers `python3 flood_risk_compute.py --summary data/rasters/prepared_layers_summary.json`
 
+## Contributors
 
-    - Fetch physical layers and build rasters with  'python3 fetch_physical.py --place "Lagos, Nigeria" '
-
-
-    - Compute flood risk with already fetched layers 'python3 flood_risk_compute.py --summary data/rasters/prepared_layers_summary.json'
+- [Shamsudeen Abubakar](https://github.com/har-booh)
+- [Samuel Oyatoye](https://github.com/awesam1)
+- [Ayomide Owoyemi](https://github.com/Ayomidejoe)
+- [Joshua Owoyemi](https://toluwajosh.github.io/)
+- [Kelvin Akyea](https://github.com/khelvyn80)
+- [Mohammed Afeez](https://github.com/NKASG)
+- [Favour Madubuko](https://github.com/favouralgo/)
+- [Taofeeq Togunwa](https://github.com/Taofeeq-T)
+- Zeenat Oyetolu
+- [Abimbola Adebakin](https://www.linkedin.com/in/abimbolaadebakin)
+- [Advantage Health Africa](https://advantagehealthafrica.com/)
