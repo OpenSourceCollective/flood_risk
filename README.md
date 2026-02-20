@@ -4,7 +4,7 @@ Welcome to the Flood Risk repo. This project builds a lightweight, open flood-ri
 
 ## Why Flood Risk?
 
-Flood exposure is growing in many cities, yet high‑quality risk maps can be slow to produce. This repo provides a reproducible, transparent pipeline that generates a 0–1 flood‑risk surface from open data so teams can iterate quickly and compare scenarios in different locations.
+Flood exposure is growing in many cities, yet high‑quality risk maps can be slow to produce. This repo provides a reproducible, transparent pipeline that generates a 0–1 flood‑risk index map from open data so individuals/teams can rapidly obtain relative flood risk evaluation of different locations.
 
 ## Key Features
 
@@ -63,12 +63,12 @@ source venv/bin/activate
 streamlit run ui.py
 ```
 
-- optional
+- Optional
 
--- Fetch meteorology data with 'python3 fetch_metrology.py --start 2023-01-01 --end 2024-12-31'
-
-
--- Fetch physical layers and build rasters with  'python3 fetch_physical.py --place "Lagos, Nigeria" '
+    - Fetch meteorology data with 'python3 fetch_metrology.py --start 2023-01-01 --end 2024-12-31'
 
 
--- Compute flood risk with already fetched layers 'python3 flood_risk_compute.py --summary data/rasters/prepared_layers_summary.json'
+    - Fetch physical layers and build rasters with  'python3 fetch_physical.py --place "Lagos, Nigeria" '
+
+
+    - Compute flood risk with already fetched layers 'python3 flood_risk_compute.py --summary data/rasters/prepared_layers_summary.json'
