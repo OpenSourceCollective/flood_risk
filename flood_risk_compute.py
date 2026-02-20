@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-flood_demo_modular_stable.py
+flood_risk_compute.py
 
 Compute a composite flood susceptibility / flood risk raster (0–1) from prepared layers.
 
@@ -16,7 +16,7 @@ Output:
   - prepared_layers_summary.json updated with flood_risk_0to1 path + weights used
 
 Run (CLI):
-  python flood_demo_modular_stable.py --summary data/rasters/prepared_layers_summary.json \
+  python flood_risk_compute.py --summary data/rasters/prepared_layers_summary.json \
          --w-dist 0.35 --w-drainage 0.25 --w-soil 0.20 --w-lulc 0.20
 """
 import os, sys, json, argparse

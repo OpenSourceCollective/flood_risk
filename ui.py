@@ -14,7 +14,7 @@ from PIL import Image, ImageDraw
 import streamlit as st
 from streamlit_folium import st_folium
 import folium
-from flood_demo_modular_stable import run as recompute_flood_risk
+from flood_risk_compute import run as recompute_flood_risk
 from branca.element import Element
 import pandas as pd
 import requests
@@ -565,6 +565,7 @@ def _quarterly_rainfall_average(df: pd.DataFrame) -> pd.DataFrame:
     return q_pivot
 
 # Sidebar control for meteorology data source
+st.sidebar.markdown("---")
 st.sidebar.subheader("Rainfall data (NASA POWER API)")
 
 met_df = None
@@ -708,7 +709,7 @@ if sel:
         pass
 
 folium.LayerControl(collapsed=False).add_to(m)
-st_folium(m, use_container_width=True, returned_objects=[])
+st_folium(m, width='stretch', returned_objects=[])
 
 
 # --------------- Rainfall Chart (below map) ----------------
@@ -741,6 +742,6 @@ if met_df is not None and len(met_df) > 0:
     ax.grid(axis='y', alpha=0.3, linestyle='--')
     
     plt.tight_layout()
-    st.pyplot(fig, use_container_width=True)
+    st.pyplot(fig, width='stretch')
 else:
     st.info("📊 Rainfall chart: Click 'Fetch rainfall data' in the sidebar to load data.")
