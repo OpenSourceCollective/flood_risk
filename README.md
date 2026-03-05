@@ -64,7 +64,7 @@ streamlit run ui.py
 ```
 
 - Optional
-
+  - To get AI-generated explanation of results/insights, `./setup_llm.sh`
   - Fetch meteorology data with `python3 fetch_metrology.py --start 2023-01-01 --end 2024-12-31`
   - Fetch physical layers and build rasters with `python3 fetch_physical.py --place "Lagos, Nigeria"`
   - Compute flood risk with already fetched layers `python3 flood_risk_compute.py --summary data/rasters/prepared_layers_summary.json`

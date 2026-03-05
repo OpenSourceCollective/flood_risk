@@ -2,6 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 Streamlit Flood Viewer — on‑map legends (no colormap selectors)
+
+LLM Integration (Optional):
+  Set environment variable to enable AI-generated risk explanations:
+    export OPENAI_API_KEY="sk-..."        # For OpenAI GPT-4
+    export ANTHROPIC_API_KEY="sk-ant-..."  # For Anthropic Claude
+  
+  If no API key is set, falls back to rule-based dynamic explanations.
 """
 import json, os, base64
 from typing import Optional, Tuple
@@ -331,6 +338,319 @@ def sample_raster_at_point(path: str, lat: float, lon: float):
         return None
     return None
 
+def extract_high_risk_regions(risk_path: str, boundaries_paths: list, risk_threshold: float = 0.7) -> list:
+    """
+    Extract subregion names with high flood risk by intersecting risk raster with boundaries.
+    Tries multiple boundary files (primary to fallback).
+    Returns list of region names with mean risk > risk_threshold.
+    """
+    try:
+        import geopandas as gpd
+        
+        # Try each boundary file in order
+        gdf = None
+        for bpath in boundaries_paths:
+            if not os.path.exists(bpath):
+                continue
+            try:
+                temp_gdf = gpd.read_file(bpath)
+                if not temp_gdf.empty:
+                    # Check for name column variants
+                    name_cols = [c for c in temp_gdf.columns if c.lower() in ('name', 'admin_name', 'district', 'region')]
+                    if name_cols:
+                        gdf = temp_gdf
+                        name_col = name_cols[0]
+                        break
+            except Exception:
+                continue
+        
+        if gdf is None or gdf.empty:
+            return []
+        
+        # Read risk raster
+        with rasterio.open(risk_path) as src:
+            risk_arr = src.read(1).astype("float32")
+            transform = src.transform
+            bounds = src.bounds  # (left, bottom, right, top)
+        
+        high_risk_regions = []
+        
+        for idx, row in gdf.iterrows():
+            geom = row.geometry
+            if geom is None or geom.is_empty:
+                continue
+            
+            # Get region name (try multiple columns)
+            region_name = None
+            for col in ['name', 'admin_name', 'district', 'region']:
+                if col in row and pd.notna(row[col]):
+                    region_name = str(row[col]).strip()
+                    if region_name:
+                        break
+            
+            if not region_name:
+                region_name = f"Region {idx}"
+            
+            # Simple check: does region geometry overlap with raster bounds?
+            geom_bounds = geom.bounds  # (minx, miny, maxx, maxy)
+            
+            # Check if geometry overlaps with raster
+            if (geom_bounds[2] < bounds[0] or geom_bounds[0] > bounds[2] or
+                geom_bounds[3] < bounds[1] or geom_bounds[1] > bounds[3]):
+                continue
+            
+            # Estimate mean risk in region (rasterize geometry and sample)
+            try:
+                from rasterio.features import rasterize as rio_rasterize
+                geom_mask = rio_rasterize([geom], out_shape=risk_arr.shape, transform=transform, fill=0)
+                region_risk_vals = risk_arr[geom_mask > 0]
+                
+                if region_risk_vals.size > 0:
+                    region_mean_risk = float(np.nanmean(region_risk_vals[~np.isnan(region_risk_vals)]))
+                    if region_mean_risk > risk_threshold:
+                        high_risk_regions.append((region_name, region_mean_risk))
+            except Exception:
+                pass
+        
+        # Deduplicate by name, keeping highest risk value for each unique name
+        region_dict = {}
+        for name, risk in high_risk_regions:
+            if name not in region_dict or risk > region_dict[name]:
+                region_dict[name] = risk
+        
+        # Sort by risk (descending)
+        sorted_regions = sorted(region_dict.items(), key=lambda x: x[1], reverse=True)
+        return [name for name, _ in sorted_regions]
+    
+    except Exception as e:
+        return []
+
+def calculate_risk_statistics(risk_path: str) -> dict:
+    """
+    Calculate comprehensive statistics from a flood risk raster.
+    
+    Returns:
+        Dictionary with risk statistics including mean, percentiles, distribution, and spatial patterns.
+    """
+    with rasterio.open(risk_path) as src:
+        risk_arr = src.read(1).astype("float32")
+    
+    # Remove nodata/NaN
+    mask = np.isnan(risk_arr) | np.isinf(risk_arr)
+    valid_risk = risk_arr[~mask]
+    
+    if valid_risk.size == 0:
+        return None
+    
+    # Compute statistics
+    stats = {
+        'mean_risk': float(np.mean(valid_risk)),
+        'median_risk': float(np.median(valid_risk)),
+        'min_risk': float(np.min(valid_risk)),
+        'max_risk': float(np.max(valid_risk)),
+        'p25_risk': float(np.percentile(valid_risk, 25)),
+        'p75_risk': float(np.percentile(valid_risk, 75)),
+        'std_risk': float(np.std(valid_risk)),
+        
+        # Risk class percentages
+        'high_risk_pct': 100.0 * np.sum(valid_risk > 0.6) / valid_risk.size,
+        'moderate_risk_pct': 100.0 * np.sum((valid_risk > 0.3) & (valid_risk <= 0.6)) / valid_risk.size,
+        'low_risk_pct': 100.0 * np.sum(valid_risk <= 0.3) / valid_risk.size,
+        'very_high_risk_pct': 100.0 * np.sum(valid_risk > 0.8) / valid_risk.size,
+    }
+    
+    # Spatial gradient (E-W slope via mean columns)
+    h, w = risk_arr.shape
+    west_mean = np.nanmean(risk_arr[:, :w//4])
+    east_mean = np.nanmean(risk_arr[:, 3*w//4:])
+    stats['gradient_direction'] = "west to east" if east_mean > west_mean else "east to west"
+    stats['gradient_strength'] = "stronger" if abs(east_mean - west_mean) > 0.15 else "subtle"
+    
+    # Clustering (std as proxy for patchiness)
+    stats['clustering_desc'] = "well-defined clusters" if stats['std_risk'] > 0.25 else "gradual transitions"
+    
+    return stats
+
+
+def generate_llm_explanation(stats: dict, high_risk_regions: list, aoi_name: str) -> str:
+    """
+    Generate flood risk explanation using LLM API.
+    Supports OpenAI, Anthropic, or local models.
+    
+    Returns explanation text, or None if LLM unavailable.
+    """
+    # Check for API keys
+    openai_key = os.environ.get('OPENAI_API_KEY')
+    anthropic_key = os.environ.get('ANTHROPIC_API_KEY')
+    
+    if not openai_key and not anthropic_key:
+        # Silently return None - will use fallback
+        return None
+    
+    # Build data-rich prompt
+    regions_str = ', '.join(high_risk_regions[:5]) if high_risk_regions else 'None identified'
+    
+    prompt = f"""You are a GIS analyst writing a technical flood risk assessment for {aoi_name}.
+
+KEY STATISTICS:
+- Overall mean risk: {stats['mean_risk']:.2f} (0-1 scale)
+- Risk distribution: {stats['high_risk_pct']:.1f}% high-risk (>0.8), {stats['moderate_risk_pct']:.1f}% moderate (0.3-0.6), {stats['low_risk_pct']:.1f}% low (≤0.3)
+- Spatial pattern: {stats['clustering_desc']}, {stats['gradient_strength']} gradient {stats['gradient_direction']}
+- High-risk neighborhoods: {regions_str}
+
+Write a concise 2-3 paragraph assessment (max 250 words) for urban planners and emergency managers. Include:
+1. Overall risk characterization and distribution
+2. Spatial patterns and what they suggest about underlying drivers
+3. Priority areas for intervention
+
+Be specific, technical, and actionable. Do NOT include headers or bullet points."""
+    
+    try:
+        # Try OpenAI first
+        if openai_key:
+            try:
+                import openai
+            except ImportError:
+                st.warning("⚠️ OpenAI API key set but 'openai' package not installed. Install with: pip install openai")
+                return None
+            
+            # Use OpenAI client API (v1.0+)
+            client = openai.OpenAI(api_key=openai_key)
+            
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",  # Faster, cheaper than gpt-4
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=350,
+                temperature=0.7
+            )
+            result = response.choices[0].message.content.strip()
+            st.sidebar.success("✓ Using OpenAI GPT-4o-mini for explanation")
+            return result
+        
+        # Try Anthropic
+        elif anthropic_key:
+            try:
+                import anthropic
+            except ImportError:
+                st.warning("⚠️ Anthropic API key set but 'anthropic' package not installed. Install with: pip install anthropic")
+                return None
+            
+            client = anthropic.Anthropic(api_key=anthropic_key)
+            
+            response = client.messages.create(
+                model="claude-3-haiku-20240307",  # Fast and cost-effective
+                max_tokens=350,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            result = response.content[0].text.strip()
+            st.sidebar.success("✓ Using Anthropic Claude Haiku for explanation")
+            return result
+    
+    except Exception as e:
+        # LLM failed, will fall back to rule-based
+        st.sidebar.warning(f"⚠️ LLM generation failed: {str(e)}")
+        return None
+    
+    return None
+
+
+def generate_dynamic_explanation(stats: dict, high_risk_regions: list, aoi_name: str) -> str:
+    """
+    Generate varied flood risk explanation using rule-based templates.
+    Fallback when LLM is unavailable.
+    """
+    # Dynamic vocabulary based on severity
+    if stats['high_risk_pct'] > 30:
+        severity = 'high'
+        descriptor = 'critical'
+        concern = 'urgent attention required'
+        action = 'immediate mitigation measures recommended'
+    elif stats['high_risk_pct'] > 10:
+        severity = 'moderate'
+        descriptor = 'moderate'
+        concern = 'warrants monitoring'
+        action = 'preventive planning advised'
+    else:
+        severity = 'low'
+        descriptor = 'manageable'
+        concern = 'generally stable conditions'
+        action = 'routine maintenance sufficient'
+    
+    # Varied opening sentences
+    import random
+    openings = [
+        f"Analysis of {aoi_name}'s flood susceptibility reveals {descriptor} risk conditions",
+        f"Flood risk assessment for {aoi_name} indicates {descriptor} vulnerability levels",
+        f"The flood risk surface across {aoi_name} shows {descriptor} hazard characteristics"
+    ]
+    
+    opening = random.choice(openings)
+    
+    # Build regional mention
+    regional_mention = ""
+    if high_risk_regions:
+        regions_str = ", ".join(high_risk_regions[:5])  # Top 5 regions
+        if len(high_risk_regions) <= 3:
+            regional_mention = f" particularly in {regions_str},"
+        else:
+            regional_mention = f" especially in {regions_str},"
+    
+    # Dynamic spatial pattern descriptions
+    if stats['clustering_desc'] == 'well-defined clusters':
+        spatial_insight = f"Risk is concentrated in discrete hotspots{regional_mention if not regional_mention else ''} suggesting localized drainage or topographic constraints."
+    else:
+        spatial_insight = f"Risk transitions gradually across the landscape, reflecting distributed hydrological factors."
+    
+    # Gradient interpretation
+    if 'west to east' in stats['gradient_direction']:
+        gradient_interpretation = "coastal accumulation patterns and urbanized low-lying areas"
+    else:
+        gradient_interpretation = "inland topographic influences and varied drainage characteristics"
+    
+    # Build varied narrative
+    explanation = f"""{opening}. The flood risk surface exhibits values ranging from {stats['min_risk']:.2f} to {stats['max_risk']:.2f}, with a median risk of {stats['median_risk']:.2f}.
+
+Risk distribution analysis shows {stats['high_risk_pct']:.1f}% of the mapped area exceeds the 0.8 high-risk threshold{regional_mention}. {stats['moderate_risk_pct']:.1f}% falls within the moderate class (0.3–0.6), and {stats['low_risk_pct']:.1f}% remains in the low-risk category. {spatial_insight} The {stats['gradient_strength']} {stats['gradient_direction']} gradient suggests {gradient_interpretation}.
+
+{action.capitalize()}. The interquartile range ({stats['p25_risk']:.2f}–{stats['p75_risk']:.2f}) indicates {'substantial variability' if stats['p75_risk'] - stats['p25_risk'] > 0.3 else 'relatively consistent'} risk levels across the study area, with {stats['clustering_desc']} consistent with underlying hydrological and land-cover drivers."""
+    
+    return explanation
+
+
+def generate_flood_risk_explanation(risk_path: str, aoi_name: str, boundaries_paths: list = None, use_ai: bool = False) -> str:
+    """
+    Generate a narrative GIS-aware explanation of the flood risk surface.
+    
+    Args:
+        risk_path: Path to flood risk raster
+        aoi_name: Area of interest name (e.g., "Accra")
+        boundaries_paths: List of GeoJSON/Shapefile paths to try (primary to fallback)
+        use_ai: If True, try LLM-based generation first; if False, use rule-based generation
+    """
+    try:
+        # Calculate statistics
+        stats = calculate_risk_statistics(risk_path)
+        
+        if stats is None:
+            return "Unable to generate explanation: no valid data."
+        
+        # Extract high-risk subregions if boundaries available
+        high_risk_regions = []
+        if boundaries_paths:
+            high_risk_regions = extract_high_risk_regions(risk_path, boundaries_paths, risk_threshold=0.65)
+        
+        # If AI is enabled, try LLM-based generation first
+        if use_ai:
+            llm_explanation = generate_llm_explanation(stats, high_risk_regions, aoi_name)
+            if llm_explanation:
+                return llm_explanation
+        
+        # Use rule-based dynamic generation (default or fallback)
+        return generate_dynamic_explanation(stats, high_risk_regions, aoi_name)
+    
+    except Exception as e:
+        return f"Error generating explanation: {str(e)}"
+
 # ---------------- Sidebar ----------------
 st.sidebar.markdown("---")
 summary_path = "data/rasters/prepared_layers_summary.json"
@@ -474,6 +794,7 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("Display settings")
 overlay_opacity = st.sidebar.slider("Overlay opacity", 0.0, 1.0, 0.50, 0.05, key="overlay_opacity")
 overlay_style = "solid"  # Fixed overlay style
+use_ai_summary = st.sidebar.checkbox("Use AI-generated summary", value=False, key="use_ai_summary")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Layers to display")
@@ -539,6 +860,113 @@ def _fetch_nasa_power_rainfall(lat: float, lon: float, start_date: str, end_date
         df = pd.DataFrame(rows, columns=["date", "rainfall"])
         df["date"] = pd.to_datetime(df["date"])
         return df.sort_values("date")
+    
+    except Exception as e:
+        st.warning(f"Failed to fetch NASA POWER data: {e}")
+        return None
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _fetch_rainfall_forecast(lat: float, lon: float, days: int = 7) -> Optional[pd.DataFrame]:
+    """Fetch rainfall forecast from Open-Meteo API (free, no API key needed).
+    
+    Args:
+        lat: Latitude (decimal degrees)
+        lon: Longitude (decimal degrees)
+        days: Number of forecast days (default 7)
+    
+    Returns:
+        DataFrame with columns: date, rainfall_mm, rainfall_prob_pct
+    """
+    try:
+        url = (
+            f"https://api.open-meteo.com/v1/forecast?"
+            f"latitude={lat}&longitude={lon}"
+            f"&daily=precipitation_sum,precipitation_probability_max"
+            f"&forecast_days={days}&timezone=auto"
+        )
+        
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        
+        daily = data.get("daily", {})
+        dates = daily.get("time", [])
+        precip = daily.get("precipitation_sum", [])
+        precip_prob = daily.get("precipitation_probability_max", [])
+        
+        if not dates or not precip:
+            return None
+        
+        rows = []
+        for i, date_str in enumerate(dates):
+            rainfall = float(precip[i]) if i < len(precip) else 0.0
+            prob = float(precip_prob[i]) if i < len(precip_prob) else 0.0
+            rows.append([date_str, rainfall, prob])
+        
+        df = pd.DataFrame(rows, columns=["date", "rainfall_mm", "rainfall_prob_pct"])
+        df["date"] = pd.to_datetime(df["date"])
+        return df
+    
+    except Exception as e:
+        return None
+
+def _assess_flood_warnings(forecast_df: pd.DataFrame, risk_path: str) -> dict:
+    """Assess flood warnings based on forecast rainfall and terrain risk.
+    
+    Returns:
+        Dict with warning levels and affected days
+    """
+    if forecast_df is None or len(forecast_df) == 0:
+        return None
+    
+    try:
+        # Read mean risk from raster
+        with rasterio.open(risk_path) as src:
+            risk_arr = src.read(1).astype("float32")
+            mask = np.isnan(risk_arr) | np.isinf(risk_arr)
+            valid_risk = risk_arr[~mask]
+            mean_risk = float(np.mean(valid_risk)) if valid_risk.size > 0 else 0.5
+            high_risk_pct = 100.0 * np.sum(valid_risk > 0.7) / valid_risk.size if valid_risk.size > 0 else 0.0
+        
+        # Define rainfall thresholds based on mean risk
+        if mean_risk > 0.8:
+            critical_threshold = 15.0
+            high_threshold = 10.0
+        elif mean_risk > 0.6:
+            critical_threshold = 30.0
+            high_threshold = 20.0
+        elif mean_risk > 0.3:
+            critical_threshold = 50.0
+            high_threshold = 35.0
+        else:
+            critical_threshold = 75.0
+            high_threshold = 50.0
+        
+        warnings = {
+            "critical_days": [],
+            "high_days": [],
+            "moderate_days": [],
+            "mean_risk": mean_risk,
+            "high_risk_pct": high_risk_pct,
+            "thresholds": {"critical": critical_threshold, "high": high_threshold}
+        }
+        
+        for _, row in forecast_df.iterrows():
+            rainfall = row["rainfall_mm"]
+            date = row["date"]
+            prob = row.get("rainfall_prob_pct", 0)
+            
+            if rainfall >= critical_threshold:
+                warnings["critical_days"].append((date, rainfall, prob))
+            elif rainfall >= high_threshold:
+                warnings["high_days"].append((date, rainfall, prob))
+            elif rainfall >= 10.0:
+                warnings["moderate_days"].append((date, rainfall, prob))
+        
+        return warnings
+    
+    except Exception:
+        return None
     
     except Exception as e:
         st.warning(f"Failed to fetch NASA POWER data: {e}")
@@ -614,15 +1042,21 @@ with st.expander("ℹ️ Understanding the Flood Risk Index", expanded=False):
 Composite score combining distance to water, drainage density, 
 soil permeability, and land cover.
 
-**Risk Categories:**
-- **0.0-0.3**: Low Risk  
-  Areas with good drainage, distance from water, and permeable surfaces
-- **0.3-0.6**: Moderate Risk  
-  Areas with mixed conditions; some vulnerability to flooding
-- **0.6-0.8**: High Risk  
-  Areas close to water, poor drainage, or impervious surfaces
-- **0.8-1.0**: Very High Risk  
-  Critical areas highly susceptible to flooding
+**Risk Categories & Rainfall Thresholds:**
+
+| Range | Level | Terrain Characteristics | Critical Rainfall (24h) |
+|---|---|---|---|
+| 0.0–0.3 | **Low Risk** | Good drainage, distance from water, permeable surfaces | 75–150+ mm |
+| 0.3–0.6 | **Moderate Risk** | Mixed conditions; some vulnerability to flooding | 50–75 mm |
+| 0.6–0.8 | **High Risk** | Close to water, poor drainage, or impervious surfaces | 30–50 mm |
+| 0.8–1.0 | **Very High Risk** | Critical areas highly susceptible to flooding | 15–30 mm |
+
+**Important Caveats:**
+- **Rainfall intensity matters**: 50mm over 1 hour is far more dangerous than 50mm over 24 hours
+- **Antecedent conditions**: Previous rainfall saturates soil, significantly lowering flood thresholds
+- **Local infrastructure**: Storm drains, retention basins, and maintenance affect actual flood risk
+- **Seasonal variation**: Dry season vs wet season soil moisture changes vulnerability
+- **Flash flooding**: High-intensity bursts (>20mm/hour) can cause flooding even in moderate-risk areas
 """)
 
 bbox = meta["bbox"]
@@ -711,6 +1145,183 @@ if sel:
 folium.LayerControl(collapsed=False).add_to(m)
 st_folium(m, width='stretch', returned_objects=[])
 
+# --------------- Flood Risk Explanation ----------------
+if show_risk and "flood_risk_0to1" in paths and os.path.exists(paths["flood_risk_0to1"]):
+    st.markdown("---")
+    st.subheader("Spatial Risk Analysis & Interpretation")
+    aoi_name = (aoi_place or _default_aoi).strip() or "the mapped area"
+    
+    # Try multiple boundary sources (primary to fallback)
+    boundaries_paths = [
+        "data/admin_boundaries.geojson",  # Districts/regions
+        "data/city_boundary.geojson",      # City/metro boundaries
+        "data/neighborhoods.geojson",      # Neighborhoods/wards
+    ]
+    
+    explanation = generate_flood_risk_explanation(
+        paths["flood_risk_0to1"], 
+        aoi_name,
+        boundaries_paths=boundaries_paths,
+        use_ai=use_ai_summary
+    )
+    st.markdown(explanation)
+    
+    # Rainfall forecast and flood warnings
+    st.markdown("---")
+    st.subheader("📅 Rainfall Forecast & Flood Warnings")
+    
+    bbox = meta.get("bbox", [0, 0, 0, 0])
+    west, south, east, north = bbox
+    center_lat = (south + north) / 2.0
+    center_lon = (west + east) / 2.0
+    
+    forecast_df = _fetch_rainfall_forecast(center_lat, center_lon, days=7)
+    
+    if forecast_df is not None and len(forecast_df) > 0:
+        warnings = _assess_flood_warnings(forecast_df, paths["flood_risk_0to1"])
+        
+        # Display warnings if any
+        if warnings:
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                if warnings["critical_days"]:
+                    st.error(f"🚨 **{len(warnings['critical_days'])} Critical Warning(s)**")
+                    for date, rainfall, prob in warnings["critical_days"]:
+                        st.markdown(f"**{date.strftime('%a, %b %d')}**: {rainfall:.1f}mm ({prob:.0f}% prob)")
+                elif warnings["high_days"]:
+                    st.warning(f"⚠️ **{len(warnings['high_days'])} High Warning(s)**")
+                    for date, rainfall, prob in warnings["high_days"]:
+                        st.markdown(f"**{date.strftime('%a, %b %d')}**: {rainfall:.1f}mm ({prob:.0f}% prob)")
+                else:
+                    st.success("✓ No critical warnings")
+            
+            with col2:
+                st.metric(
+                    "Area Mean Risk", 
+                    f"{warnings['mean_risk']:.2f}",
+                    help="Average flood susceptibility across mapped area"
+                )
+                st.metric(
+                    "High-Risk Area", 
+                    f"{warnings['high_risk_pct']:.1f}%",
+                    help="Percentage of area with risk > 0.7"
+                )
+            
+            with col3:
+                st.metric(
+                    "Critical Threshold", 
+                    f"{warnings['thresholds']['critical']:.0f}mm/24h",
+                    help="Rainfall amount likely to cause flooding in high-risk areas"
+                )
+                st.metric(
+                    "High Threshold", 
+                    f"{warnings['thresholds']['high']:.0f}mm/24h",
+                    help="Rainfall amount that may cause localized flooding"
+                )
+        
+        # Show enhanced forecast table
+        st.markdown("**7-Day Rainfall Forecast:**")
+        
+        # Build enhanced forecast display
+        forecast_display = forecast_df.copy()
+        
+        # Store original rainfall values before formatting (for styling)
+        rainfall_values = forecast_display["rainfall_mm"].values
+        
+        forecast_display["Day"] = forecast_display["date"].dt.strftime("%a")
+        forecast_display["Date"] = forecast_display["date"].dt.strftime("%b %d")
+        
+        # Add risk assessment column
+        def get_risk_level(rainfall, thresholds):
+            if rainfall >= thresholds['critical']:
+                return "🚨 Critical"
+            elif rainfall >= thresholds['high']:
+                return "⚠️ High"
+            elif rainfall >= 10.0:
+                return "⚪ Moderate"
+            else:
+                return "✓ Low"
+        
+        forecast_display["Flood Risk"] = forecast_display["rainfall_mm"].apply(
+            lambda x: get_risk_level(x, warnings['thresholds']) if warnings else "—"
+        )
+        
+        # Add weather icon based on rainfall amount
+        def get_weather_icon(rainfall):
+            if rainfall >= 50:
+                return "⛈️"
+            elif rainfall >= 20:
+                return "🌧️"
+            elif rainfall >= 5:
+                return "🌦️"
+            elif rainfall >= 0.5:
+                return "🌤️"
+            else:
+                return "☀️"
+        
+        forecast_display[""] = forecast_display["rainfall_mm"].apply(get_weather_icon)
+        
+        # Format columns
+        forecast_display["Rainfall"] = forecast_display["rainfall_mm"].apply(lambda x: f"{x:.1f} mm")
+        forecast_display["Probability"] = forecast_display["rainfall_prob_pct"].apply(lambda x: f"{x:.0f}%")
+        
+        # Select and reorder columns for display
+        display_cols = ["", "Day", "Date", "Rainfall", "Probability", "Flood Risk"]
+        forecast_table = forecast_display[display_cols].copy()
+        
+        # Enhanced styling function
+        def style_forecast_table(row):
+            # Get the rainfall value using the row index
+            idx = row.name
+            rainfall = rainfall_values[idx] if idx < len(rainfall_values) else 0.0
+            
+            styles = [''] * len(row)
+            
+            if warnings:
+                if rainfall >= warnings['thresholds']['critical']:
+                    # Critical: black background
+                    styles = ['background-color: #000000; font-weight: bold'] * len(row)
+                elif rainfall >= warnings['thresholds']['high']:
+                    # High: black background
+                    styles = ['background-color: #000000; font-weight: 500'] * len(row)
+                elif rainfall >= 10.0:
+                    # Moderate: black background
+                    styles = ['background-color: #000000'] * len(row)
+           
+            return styles
+        
+        # Display styled table
+        styled_table = forecast_table.style.apply(style_forecast_table, axis=1)
+        
+        # Add bar chart visualization for rainfall (using numeric values)
+        # We need to temporarily add the numeric column for the bar chart
+        forecast_table_numeric = forecast_table.copy()
+        forecast_table_numeric['Rainfall_numeric'] = rainfall_values
+        
+        st.dataframe(
+            styled_table,
+            hide_index=True,
+            use_container_width=True,
+            height=280
+        )
+        
+        st.caption(f"📡 Forecast data from Open-Meteo API for {center_lat:.4f}°N, {center_lon:.4f}°E • Updates every 30 minutes")
+    else:
+        st.info("📡 Unable to fetch rainfall forecast. Check internet connection.")
+    
+    # Optional: Show layer contribution summary
+    st.markdown("---")
+    weights = meta.get("flood_risk_weights_used", {})
+    # if weights:
+    #     st.markdown("**Weights used in computation:**")
+    #     w_col1, w_col2 = st.columns(2)
+    #     with w_col1:
+    #         st.metric("Distance to water", f"{weights.get('dist', 0):.2f}")
+    #         st.metric("Drainage density", f"{weights.get('drainage', 0):.2f}")
+    #     with w_col2:
+    #         st.metric("Soil infiltration", f"{weights.get('soil', 0):.2f}")
+    #         st.metric("Land cover (LULC)", f"{weights.get('lulc', 0):.2f}")
 
 # --------------- Rainfall Chart (below map) ----------------
 if met_df is not None and len(met_df) > 0:
@@ -725,7 +1336,7 @@ if met_df is not None and len(met_df) > 0:
     st.caption(f"NASA POWER data at AOI centroid ({center_lat:.4f}°N, {center_lon:.4f}°E) — {date_range}")
     
     # Create stacked bar chart
-    fig, ax = plt.subplots(figsize=(10, 5))
+    fig, ax = plt.subplots(figsize=(10, 3))
     
     # Define consistent color scheme for years (shades of blue)
     years = qdf.columns.tolist()

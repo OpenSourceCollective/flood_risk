@@ -495,15 +495,28 @@ def fetch_and_save_city_boundary(bbox, place_name="Lagos", max_retries=2, show_f
     from shapely.geometry import shape
     boundary_path = Path("data/city_boundary.geojson")
     
-    # Extract city name from place_name (e.g., "Lagos" from "Lagos, Nigeria")
-    city_name = place_name.split(",")[0].strip()
+    # Extract city name and other components from place_name
+    # e.g., "Lagos, Nigeria" -> city_name="Lagos", country="Nigeria"
+    parts = [p.strip() for p in place_name.split(",")]
+    city_name = parts[0] if parts else place_name
+    country = parts[1] if len(parts) > 1 else ""
     
     # Try multiple queries to find suitable polygon boundary
+    # Start with more specific (state/metro) and progressively fall back
     queries = [
-        place_name,                      # Full place name as provided
-        f"{city_name}",                  # City name only
-        f"{city_name} city",             # City with "city" keyword
+        place_name,                           # Full place name as provided
+        f"{city_name} State {country}".strip() if country else f"{city_name} State",  # City State Country
+        f"{city_name} State",                 # City State (e.g., "Lagos State")
+        f"{city_name} Metropolitan Area",     # Metropolitan Area
+        f"{city_name} Metro",                 # Metro
+        f"{city_name} city {country}".strip() if country else f"{city_name} city",  # City + country
+        f"{city_name} city",                  # City with "city" keyword
+        f"{city_name}",                       # City name only
     ]
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    queries = [q for q in queries if not (q in seen or seen.add(q))]
     
     headers = {"User-Agent": "flood-risk-model/1.0"}
     

@@ -37,5 +37,8 @@ cache/
 *.tiff
 *.geojson
 
+tmp/
+*.geojson
+
 # Logs
 logs/
