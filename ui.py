@@ -683,10 +683,10 @@ normalize_weights = st.sidebar.checkbox("Normalize weights to sum to 1", value=T
 # defaults: all weights equal at 0.25
 w_defaults = {"dist": 0.25, "drainage": 0.25, "soil": 0.25, "lulc": 0.25}
 
-w_dist = st.sidebar.slider("Weight: distance to waterways", 0.0, 1.0, float(w_defaults["dist"]), 0.01, key="w_dist")
-w_dd   = st.sidebar.slider("Weight: drainage density",      0.0, 1.0, float(w_defaults["drainage"]), 0.01, key="w_dd")
-w_soil = st.sidebar.slider("Weight: soil infiltration",     0.0, 1.0, float(w_defaults["soil"]), 0.01, key="w_soil")
-w_lulc = st.sidebar.slider("Weight: land cover (LULC)",      0.0, 1.0, float(w_defaults["lulc"]), 0.01, key="w_lulc")
+w_dist = st.sidebar.slider("Weight: Distance to waterways", 0.0, 1.0, float(w_defaults["dist"]), 0.01, key="w_dist")
+w_dd   = st.sidebar.slider("Weight: Drainage density",      0.0, 1.0, float(w_defaults["drainage"]), 0.01, key="w_dd")
+w_soil = st.sidebar.slider("Weight: Soil infiltration",     0.0, 1.0, float(w_defaults["soil"]), 0.01, key="w_soil")
+w_lulc = st.sidebar.slider("Weight: Land Use Land Cover (LULC)",      0.0, 1.0, float(w_defaults["lulc"]), 0.01, key="w_lulc")
 
 # ===== Session state for smart caching =====
 # Track the AOI location & weights from previous runs to detect changes
@@ -726,6 +726,15 @@ def _run_fetch_physical_direct(place: str) -> str:
         raise RuntimeError(f"fetch_physical failed: {str(e)}")
     finally:
         sys.argv = orig_argv
+
+def _sync_weight_sliders(weights: dict) -> None:
+    """Update slider state to match the weights actually used in computation."""
+    if not isinstance(weights, dict):
+        return
+    st.session_state["w_dist"] = float(weights.get("dist", st.session_state.get("w_dist", w_defaults["dist"])))
+    st.session_state["w_dd"] = float(weights.get("drainage", st.session_state.get("w_dd", w_defaults["drainage"])))
+    st.session_state["w_soil"] = float(weights.get("soil", st.session_state.get("w_soil", w_defaults["soil"])))
+    st.session_state["w_lulc"] = float(weights.get("lulc", st.session_state.get("w_lulc", w_defaults["lulc"])))
 
 if st.sidebar.button("Compute flood risk", key="btn_recompute"):
     try:
@@ -771,6 +780,7 @@ if st.sidebar.button("Compute flood risk", key="btn_recompute"):
                     out_path_override=None,
                     normalize_weights=normalize_weights,
                 )
+                _sync_weight_sliders(w_final)
                 st.sidebar.success(f"Recomputed: {out_path}")
                 st.sidebar.json({"weights_used": w_final})
         
@@ -1335,7 +1345,7 @@ if met_df is not None and len(met_df) > 0:
     date_range = f"{met_df['date'].min().strftime('%Y-%m-%d')} to {met_df['date'].max().strftime('%Y-%m-%d')}"
     st.caption(f"NASA POWER data at AOI centroid ({center_lat:.4f}°N, {center_lon:.4f}°E) — {date_range}")
     
-    # Create stacked bar chart
+    # Create side-by-side bar chart
     fig, ax = plt.subplots(figsize=(10, 3))
     
     # Define consistent color scheme for years (shades of blue)
@@ -1343,8 +1353,8 @@ if met_df is not None and len(met_df) > 0:
     # Use Blues colormap with adjusted range to avoid too light colors
     colors = plt.cm.Blues(np.linspace(0.4, 0.9, len(years)))
     
-    # Plot stacked bars
-    qdf.plot(kind='bar', stacked=True, ax=ax, color=colors, width=0.7)
+    # Plot grouped side-by-side bars
+    qdf.plot(kind='bar', stacked=False, ax=ax, color=colors, width=0.8)
     
     ax.set_xlabel("Quarter", fontsize=11)
     ax.set_ylabel("Average rainfall (mm/day)", fontsize=11)

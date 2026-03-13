@@ -64,13 +64,13 @@ streamlit run ui.py
 ```
 
 - Optional
-  - To get AI-generated explanation of results/insights, `./setup_llm.sh`
+  - To get AI-generated spatial risk explanation of results, `./setup_llm.sh`
   - Fetch meteorology data with `python3 fetch_metrology.py --start 2023-01-01 --end 2024-12-31`
   - Fetch physical layers and build rasters with `python3 fetch_physical.py --place "Lagos, Nigeria"`
   - Compute flood risk with already fetched layers `python3 flood_risk_compute.py --summary data/rasters/prepared_layers_summary.json`
 
 ## Contributors
-
+- [Axum AI] (https://github.com/har-booh)
 - [Shamsudeen Abubakar](https://github.com/har-booh)
 - [Samuel Oyatoye](https://github.com/awesam1)
 - [Ayomide Owoyemi](https://github.com/Ayomidejoe)
@@ -81,4 +81,4 @@ streamlit run ui.py
 - [Taofeeq Togunwa](https://github.com/Taofeeq-T)
 - Zeenat Oyetolu
 - [Abimbola Adebakin](https://www.linkedin.com/in/abimbolaadebakin)
-- [Advantage Health Africa](https://advantagehealthafrica.com/)
+- 
