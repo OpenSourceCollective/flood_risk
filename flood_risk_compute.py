@@ -70,22 +70,34 @@ def _pick_lulc_key(outputs: dict) -> str:
                    "lulc_worldcover_proxy, lulc_io_annual_proxy, lulc_proxy, lulc.")
 
 def run(summary_path, w_dist=0.35, w_drainage=0.25, w_soil=0.20, w_lulc=0.20,
-        out_path_override=None, normalize_weights=False):
+        out_path_override=None, normalize_weights=False, progress_callback=None):
     """
     Compute flood_risk_0to1.tif from prepared layers.
 
     If normalize_weights=True, weights are scaled to sum to 1 (useful when sliders are changed).
+    
+    Args:
+        progress_callback: Optional callable(step, total, label) to report progress.
+                          step: current step (0 to total)
+                          total: total steps
+                          label: human-readable task description
     """
+    def _report_progress(step, total, label):
+        if progress_callback:
+            progress_callback(step, total, label)
+    
     with open(summary_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
     p = meta.get("outputs", {})
 
     lulc_key = _pick_lulc_key(p)
 
+    _report_progress(1, 5, "Reading input layers...")
     with rasterio.open(p["dist_to_river_m"]) as src:
         dist = src.read(1); transform = src.transform; crs = src.crs
     with rasterio.open(p["drainage_density_km_per_km2"]) as src:
         dd = src.read(1)
+    _report_progress(2, 5, "Reading soil and LULC layers...")
     with rasterio.open(p["soil_sand_pct"]) as src:
         soil = src.read(1)
     with rasterio.open(p[lulc_key]) as src:
@@ -99,6 +111,7 @@ def run(summary_path, w_dist=0.35, w_drainage=0.25, w_soil=0.20, w_lulc=0.20,
         if s > 0:
             weights = {k: v/s for k, v in weights.items()}
 
+    _report_progress(3, 5, "Computing risk layers...")
     risk01 = compute_risk(dist, dd, soil, lulc, weights)
 
     out_path = out_path_override or os.path.join(os.path.dirname(summary_path), "flood_risk_0to1.tif")
@@ -113,9 +126,11 @@ def run(summary_path, w_dist=0.35, w_drainage=0.25, w_soil=0.20, w_lulc=0.20,
         "compress": "deflate",
         "nodata": np.nan,
     }
+    _report_progress(4, 5, "Writing output raster...")
     with rasterio.open(out_path, "w", **profile) as dst:
         dst.write(risk01.astype("float32"), 1)
 
+    _report_progress(5, 5, "Updating metadata...")
     meta.setdefault("outputs", {})
     meta["outputs"]["flood_risk_0to1"] = out_path
     meta["flood_risk_weights_used"] = weights

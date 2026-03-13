@@ -48,6 +48,77 @@ NOMINATIM_CONTACT_EMAIL = "axumaicollective@gmail.com"
 
 st.set_page_config(page_title="Flood Risk Viewer", layout="wide")
 
+# ===== Progress Manager =====
+class ProgressManager:
+    """Simple progress bar orchestrator for multi-stage computations.
+    
+    Stages:
+      - 0–50%: Fetch physical layers
+      - 50–100%: Compute flood risk
+    """
+    def __init__(self):
+        self.progress_placeholder = None
+        self.label_placeholder = None
+        self.overall_progress = 0.0
+        self.stage = "idle"  # idle, fetching, computing, done
+    
+    def initialize_ui(self):
+        """Create placeholders for progress bar and label in main content area."""
+        self.progress_placeholder = st.empty()
+        self.label_placeholder = st.empty()
+    
+    def report_progress(self, stage: str, step: int, total: int, label: str):
+        """
+        Report progress from a computation stage.
+        
+        Args:
+            stage: "fetch" (0–50%) or "compute" (50–100%)
+            step: current step (1 to total)
+            total: total steps in this stage
+            label: human-readable task description
+        """
+        if stage == "fetch":
+            self.overall_progress = (step / max(total, 1)) * 0.5
+        elif stage == "compute":
+            self.overall_progress = 0.5 + (step / max(total, 1)) * 0.5
+        else:
+            return
+        
+        # Clamp to [0, 1]
+        self.overall_progress = min(1.0, max(0.0, self.overall_progress))
+        
+        # Update UI
+        if self.progress_placeholder is not None:
+            with self.progress_placeholder.container():
+                st.progress(self.overall_progress, text=f"{int(self.overall_progress * 100)}%")
+        
+        if self.label_placeholder is not None:
+            with self.label_placeholder.container():
+                st.caption(f"📊 {label}")
+    
+    def complete(self):
+        """Mark computation as complete and show final message."""
+        self.overall_progress = 1.0
+        if self.progress_placeholder is not None:
+            with self.progress_placeholder.container():
+                st.progress(1.0, text="✓ Complete")
+        if self.label_placeholder is not None:
+            with self.label_placeholder.container():
+                st.caption("✓ Computation finished successfully")
+        self.stage = "done"
+    
+    def clear(self):
+        """Clear progress UI."""
+        if self.progress_placeholder is not None:
+            self.progress_placeholder.empty()
+        if self.label_placeholder is not None:
+            self.label_placeholder.empty()
+        self.stage = "idle"
+        self.overall_progress = 0.0
+
+# Global progress manager instance
+_progress_mgr = ProgressManager()
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def read_summary(summary_path: str) -> dict:
     """Cached summary JSON reading to avoid repeated file I/O."""
@@ -709,8 +780,13 @@ def _summary_path_changed() -> bool:
     """Check if summary path has changed since last load."""
     return summary_path != st.session_state.cached_summary_path
 
-def _run_fetch_physical_direct(place: str) -> str:
-    """Run fetch_physical by calling main() directly (no subprocess overhead)."""
+def _run_fetch_physical_direct(place: str, progress_callback=None) -> str:
+    """Run fetch_physical by calling main() directly (no subprocess overhead).
+    
+    Args:
+        place: Location name (e.g., "Lagos, Nigeria")
+        progress_callback: Optional callable(step, total, label) for progress reporting.
+    """
     place = (place or "").strip()
     if not place:
         place = "Lagos, Nigeria"
@@ -719,8 +795,8 @@ def _run_fetch_physical_direct(place: str) -> str:
     orig_argv = sys.argv
     try:
         sys.argv = ["fetch_physical.py", "--place", place]
-        # Call main() directly
-        fetch_physical_main()
+        # Call main() directly with progress callback
+        fetch_physical_main(progress_callback=progress_callback)
         return f"✓ Fetched layers for: {place}"
     except Exception as e:
         raise RuntimeError(f"fetch_physical failed: {str(e)}")
@@ -738,51 +814,68 @@ def _sync_weight_sliders(weights: dict) -> None:
 
 if st.sidebar.button("Compute flood risk", key="btn_recompute"):
     try:
+        # Initialize progress UI in main content area
+        _progress_mgr.initialize_ui()
+        
         # Determine if we need to fetch (AOI changed) or just recompute (weights changed)
         need_fetch = fetch_first and _aoi_changed()
         need_recompute = True  # Always recompute after fetch or when weights change
         
+        # Helper function to report fetch progress (maps to 0–50% overall)
+        def fetch_progress_callback(step: int, total: int, label: str):
+            _progress_mgr.report_progress("fetch", step, total, label)
+        
+        # Helper function to report compute progress (maps to 50–100% overall)
+        def compute_progress_callback(step: int, total: int, label: str):
+            _progress_mgr.report_progress("compute", step, total, label)
+        
         # Step 1: Fetch physical layers if AOI location changed
         if need_fetch:
             current_aoi = aoi_place.strip() or _default_aoi
-            with st.sidebar.status(f"Fetching physical layers for '{current_aoi}'…", expanded=False):
-                try:
-                    if not DIRECT_FETCH_AVAILABLE:
-                        st.sidebar.warning("Direct fetch unavailable, skipping layer fetch.")
-                    else:
-                        msg = _run_fetch_physical_direct(current_aoi)
-                        st.sidebar.success(msg)
-                        # Update cached AOI after successful fetch
-                        st.session_state.cached_aoi_place = current_aoi
-                        # Clear cache before reloading metadata (files have changed)
-                        read_summary.clear()
-                        # Reload metadata after fetch
-                        meta = read_summary(summary_path)
-                        paths = meta["outputs"]
-                        st.session_state.cached_meta = meta
-                        st.session_state.cached_paths = paths
-                except Exception as e:
-                    st.sidebar.error(f"Failed to fetch layers: {str(e)}")
-                    st.sidebar.exception(e)
-                    st.stop()
+            try:
+                if not DIRECT_FETCH_AVAILABLE:
+                    st.warning("⚠️ Direct fetch unavailable, skipping layer fetch.")
+                else:
+                    msg = _run_fetch_physical_direct(current_aoi, progress_callback=fetch_progress_callback)
+                    # Update cached AOI after successful fetch
+                    st.session_state.cached_aoi_place = current_aoi
+                    # Clear cache before reloading metadata (files have changed)
+                    read_summary.clear()
+                    # Reload metadata after fetch
+                    meta = read_summary(summary_path)
+                    paths = meta["outputs"]
+                    st.session_state.cached_meta = meta
+                    st.session_state.cached_paths = paths
+                    st.info(msg)
+            except Exception as e:
+                _progress_mgr.clear()
+                st.error(f"❌ Failed to fetch layers: {str(e)}")
+                st.exception(e)
+                st.stop()
         else:
             if _aoi_changed():
-                st.sidebar.info(f"ℹ AOI changed but 'Fetch physical layers' is disabled. Using existing data.")
+                st.info(f"ℹ️ AOI changed but 'Fetch physical layers' is disabled. Using existing data.")
             else:
-                st.sidebar.info("✓ AOI unchanged. Skipping fetch, only recomputing weights.")
+                st.info("✓ AOI unchanged. Skipping fetch, only recomputing weights.")
         
         # Step 2: Recompute flood risk (always, since weights may have changed)
         if need_recompute:
-            with st.sidebar.status("Recomputing flood risk…", expanded=False):
+            try:
                 out_path, w_final = recompute_flood_risk(
                     summary_path=summary_path,
                     w_dist=w_dist, w_drainage=w_dd, w_soil=w_soil, w_lulc=w_lulc,
                     out_path_override=None,
                     normalize_weights=normalize_weights,
+                    progress_callback=compute_progress_callback,
                 )
                 _sync_weight_sliders(w_final)
-                st.sidebar.success(f"Recomputed: {out_path}")
-                st.sidebar.json({"weights_used": w_final})
+                st.success(f"✓ Recomputed: {out_path}")
+                st.json({"weights_used": w_final})
+            except Exception as e:
+                _progress_mgr.clear()
+                st.error(f"❌ Failed to recompute: {str(e)}")
+                st.exception(e)
+                st.stop()
         
         # Step 3: Reload metadata and rerun to update map
         # Clear ALL caches since files have been updated
@@ -794,11 +887,16 @@ if st.sidebar.button("Compute flood risk", key="btn_recompute"):
         st.session_state.cached_meta = meta
         st.session_state.cached_paths = paths
         st.session_state.cached_summary_path = summary_path
+        
+        # Mark completion and wait briefly before rerun
+        _progress_mgr.complete()
+        time.sleep(1)
         st.rerun()
 
     except Exception as e:
-        st.sidebar.error("Failed to recompute")
-        st.sidebar.exception(e)
+        _progress_mgr.clear()
+        st.error("❌ Failed to recompute")
+        st.exception(e)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Display settings")

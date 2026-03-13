@@ -684,7 +684,20 @@ def parse_args():
                     help="Show detailed feedback during boundary fetch (for debugging)")
     return ap.parse_args()
 
-def main():
+def main(progress_callback=None):
+    """
+    Main workflow for fetching and preparing physical layers.
+    
+    Args:
+        progress_callback: Optional callable(step, total, label) for progress reporting.
+                          step: current step (1 to total)
+                          total: total steps
+                          label: human-readable task description
+    """
+    def _report_progress(step, total, label):
+        if progress_callback:
+            progress_callback(step, total, label)
+    
     args = parse_args()
     CFG.place_name = args.place
     CFG.grid_res_deg = float(args.grid_res_deg)
@@ -698,12 +711,14 @@ def main():
     crs = CRS.from_epsg(CFG.crs_epsg)
 
     print("=== Fetch & Prepare Layers (improved) ===")
+    _report_progress(1, 10, "Geocoding location...")
     aoi = geocode_aoi(CFG.place_name)
     bbox = bbox_from_gdf(aoi, buffer_deg=CFG.buffer_deg)
     print(f"  Analysis bbox: {bbox}")
     
     # Auto-fetch city boundary if enabled
     boundary_geom = None
+    _report_progress(2, 10, "Loading city boundary...")
     if args.auto_fetch_boundary:
         print(f"[INFO] Loading or fetching city boundary for masking...")
         boundary_geom = load_city_boundary()
@@ -763,8 +778,10 @@ def main():
     transform, out_shape = make_raster_grid_from_bbox(bbox, CFG.grid_res_deg)
 
     # Water features
+    _report_progress(3, 10, "Fetching OSM waterways...")
     water_lines, water_polys = fetch_osm_waterways_and_waterpolys(bbox)
 
+    _report_progress(4, 10, "Computing distance to water...")
     dist = compute_distance_to_water_raster(water_lines, water_polys, transform, out_shape, grid_res_deg=CFG.grid_res_deg)
     if boundary_geom is not None:
         # Mask distance raster to city boundary
@@ -772,6 +789,7 @@ def main():
     dist_path = os.path.join(CFG.out_dir, "dist_to_river_m.tif")
     save_geotiff(dist_path, dist, transform, crs, nodata=np.nan, dtype="float32")
 
+    _report_progress(5, 10, "Computing drainage density...")
     dd_grid = compute_drainage_density_grid(water_lines, bbox, CFG.fishnet_cell_deg)
     dd = rasterize_grid_values(dd_grid, "dd_km_per_km2", transform, out_shape)
     dd = smooth_raster(dd, CFG.smooth_drainage_sigma)
@@ -782,6 +800,7 @@ def main():
     save_geotiff(dd_path, dd, transform, crs, nodata=0.0, dtype="float32")
 
     # LULC
+    _report_progress(6, 10, "Fetching land cover (LULC) data...")
     wc_out = os.path.join(CFG.out_dir, "lulc_worldcover_proxy.tif")
     io_out = os.path.join(CFG.out_dir, "lulc_io_annual_proxy.tif")
     lulc_path, provider = fetch_worldcover_or_io_to_grid(bbox, transform, out_shape, wc_out, io_out, year=CFG.worldcover_year)
@@ -797,10 +816,12 @@ def main():
         save_geotiff(lulc_path, lulc_arr, transform, crs, nodata=0, dtype="uint8")
 
     # Soil
+    _report_progress(7, 10, "Fetching soil data...")
     soil_raw = os.path.join(CFG.tmp_dir, "soil_sand_raw.tif")
     download_soilgrids_bbox(bbox, soil_raw, coverage="sand_0-5cm_Q0.5", res_m=CFG.soil_res_m)
 
     soil_path = os.path.join(CFG.out_dir, "soil_sand_pct.tif")
+    _report_progress(8, 10, "Reprojecting soil data...")
     import rasterio.warp
     print(f"[DEBUG] Opening SoilGrids raster: {soil_raw}")
     with safe_rio_open(soil_raw) as src:
@@ -836,6 +857,7 @@ def main():
         # Save masked soil
         save_geotiff(soil_path, soil_arr, transform, crs, nodata=0, dtype=src.dtypes[0])
 
+    _report_progress(9, 10, "Finalizing outputs...")
     outputs = {
         "dist_to_river_m": dist_path,
         "drainage_density_km_per_km2": dd_path,
@@ -868,6 +890,7 @@ def main():
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
+    _report_progress(10, 10, "Completed!")
     print(f"Wrote: {summary_path}")
     print("=== Done ===")
 
