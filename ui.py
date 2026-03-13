@@ -59,13 +59,18 @@ class ProgressManager:
     def __init__(self):
         self.progress_placeholder = None
         self.label_placeholder = None
+        self.stop_placeholder = None
         self.overall_progress = 0.0
         self.stage = "idle"  # idle, fetching, computing, done
     
     def initialize_ui(self):
-        """Create placeholders for progress bar and label in main content area."""
+        """Create placeholders for progress bar, label, and stop button in main content area."""
         self.progress_placeholder = st.empty()
         self.label_placeholder = st.empty()
+        self.stop_placeholder = st.empty()
+        # Render the stop button — clicking it triggers a Streamlit rerun,
+        # which kills the current computation. Cancellation detection handles the rest.
+        self.stop_placeholder.button("⏹ Stop computation", key="btn_stop_compute", type="secondary")
     
     def report_progress(self, stage: str, step: int, total: int, label: str):
         """
@@ -105,6 +110,8 @@ class ProgressManager:
         if self.label_placeholder is not None:
             with self.label_placeholder.container():
                 st.caption("✓ Computation finished successfully")
+        if self.stop_placeholder is not None:
+            self.stop_placeholder.empty()
         self.stage = "done"
     
     def clear(self):
@@ -113,6 +120,8 @@ class ProgressManager:
             self.progress_placeholder.empty()
         if self.label_placeholder is not None:
             self.label_placeholder.empty()
+        if self.stop_placeholder is not None:
+            self.stop_placeholder.empty()
         self.stage = "idle"
         self.overall_progress = 0.0
 
@@ -129,6 +138,11 @@ def raster_bounds_latlon(path: str) -> Tuple[Tuple[float, float], Tuple[float, f
     with rasterio.open(path) as src:
         left, bottom, right, top = src.bounds
     return (bottom, left), (top, right)
+
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=50)
+def raster_bounds_latlon_cached(path: str) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    """Cached raster bounds. Protects against file overwrites during cancelled computations."""
+    return raster_bounds_latlon(path)
 
 def read_raster_array_and_stats(path: str, nodata=None, max_dim: int = 2000):
     with rasterio.open(path) as src:
@@ -769,6 +783,33 @@ if "cached_paths" not in st.session_state:
     st.session_state.cached_paths = None
 if "cached_meta" not in st.session_state:
     st.session_state.cached_meta = None
+# Cancellation tracking
+if "_compute_in_progress" not in st.session_state:
+    st.session_state._compute_in_progress = False
+if "_pre_compute_summary" not in st.session_state:
+    st.session_state._pre_compute_summary = None
+if "_needs_full_refetch" not in st.session_state:
+    st.session_state._needs_full_refetch = False
+if "_pre_compute_aoi" not in st.session_state:
+    st.session_state._pre_compute_aoi = None
+
+# ===== Cancellation detection =====
+# If the previous run was interrupted mid-computation (user clicked Stop or any widget),
+# restore the backed-up summary so the old map renders correctly from cache.
+if st.session_state._compute_in_progress:
+    st.session_state._compute_in_progress = False
+    st.session_state._needs_full_refetch = True
+    if st.session_state._pre_compute_summary is not None:
+        try:
+            with open(summary_path, "w", encoding="utf-8") as f:
+                json.dump(st.session_state._pre_compute_summary, f, indent=2)
+            read_summary.clear()
+        except Exception:
+            pass
+    prev_aoi = st.session_state._pre_compute_aoi or "previous location"
+    st.warning(f"⏹ Computation was stopped. Showing previous results for **{prev_aoi}**.")
+    st.session_state._pre_compute_summary = None
+    st.session_state._pre_compute_aoi = None
 
 def _aoi_changed() -> bool:
     """Check if AOI location has changed since last fetch."""
@@ -814,11 +855,34 @@ def _sync_weight_sliders(weights: dict) -> None:
 
 if st.sidebar.button("Compute flood risk", key="btn_recompute"):
     try:
-        # Initialize progress UI in main content area
+        # Initialize progress UI in main content area (includes Stop button)
         _progress_mgr.initialize_ui()
         
+        # Back up current state before computation so cancellation can restore it
+        st.session_state._pre_compute_summary = read_summary(summary_path)
+        st.session_state._pre_compute_aoi = meta.get("aoi_place", _default_aoi)
+        
+        # Pre-warm raster caches for ALL layers so fallback rendering works
+        # even for layers that weren't toggled on before computation started.
+        for _layer_key, _cmap in CMAPS.items():
+            if _layer_key in paths and os.path.exists(paths[_layer_key]):
+                try:
+                    raster_to_rgba_image_cached(paths[_layer_key], cmap_name=_cmap, overlay_style="solid")
+                    raster_bounds_latlon_cached(paths[_layer_key])
+                except Exception:
+                    pass
+        # Also pre-warm flood risk layer (key may differ from CMAPS keys)
+        if "flood_risk_0to1" in paths and os.path.exists(paths["flood_risk_0to1"]):
+            try:
+                raster_to_rgba_image_cached(paths["flood_risk_0to1"], cmap_name="viridis", overlay_style="solid")
+                raster_bounds_latlon_cached(paths["flood_risk_0to1"])
+            except Exception:
+                pass
+        
+        st.session_state._compute_in_progress = True
+        
         # Determine if we need to fetch (AOI changed) or just recompute (weights changed)
-        need_fetch = fetch_first and _aoi_changed()
+        need_fetch = fetch_first and (_aoi_changed() or st.session_state._needs_full_refetch)
         need_recompute = True  # Always recompute after fetch or when weights change
         
         # Helper function to report fetch progress (maps to 0–50% overall)
@@ -839,15 +903,11 @@ if st.sidebar.button("Compute flood risk", key="btn_recompute"):
                     msg = _run_fetch_physical_direct(current_aoi, progress_callback=fetch_progress_callback)
                     # Update cached AOI after successful fetch
                     st.session_state.cached_aoi_place = current_aoi
-                    # Clear cache before reloading metadata (files have changed)
-                    read_summary.clear()
-                    # Reload metadata after fetch
-                    meta = read_summary(summary_path)
-                    paths = meta["outputs"]
-                    st.session_state.cached_meta = meta
-                    st.session_state.cached_paths = paths
                     st.info(msg)
             except Exception as e:
+                st.session_state._compute_in_progress = False
+                st.session_state._pre_compute_summary = None
+                st.session_state._pre_compute_aoi = None
                 _progress_mgr.clear()
                 st.error(f"❌ Failed to fetch layers: {str(e)}")
                 st.exception(e)
@@ -872,15 +932,24 @@ if st.sidebar.button("Compute flood risk", key="btn_recompute"):
                 st.success(f"✓ Recomputed: {out_path}")
                 st.json({"weights_used": w_final})
             except Exception as e:
+                st.session_state._compute_in_progress = False
+                st.session_state._pre_compute_summary = None
+                st.session_state._pre_compute_aoi = None
                 _progress_mgr.clear()
                 st.error(f"❌ Failed to recompute: {str(e)}")
                 st.exception(e)
                 st.stop()
         
-        # Step 3: Reload metadata and rerun to update map
+        # Step 3: Computation succeeded — clear cancellation state and update caches
+        st.session_state._compute_in_progress = False
+        st.session_state._pre_compute_summary = None
+        st.session_state._pre_compute_aoi = None
+        st.session_state._needs_full_refetch = False
+        
         # Clear ALL caches since files have been updated
         read_summary.clear()
         raster_to_rgba_image_cached.clear()
+        raster_bounds_latlon_cached.clear()
         
         meta = read_summary(summary_path)
         paths = meta["outputs"]
@@ -894,6 +963,9 @@ if st.sidebar.button("Compute flood risk", key="btn_recompute"):
         st.rerun()
 
     except Exception as e:
+        st.session_state._compute_in_progress = False
+        st.session_state._pre_compute_summary = None
+        st.session_state._pre_compute_aoi = None
         _progress_mgr.clear()
         st.error("❌ Failed to recompute")
         st.exception(e)
@@ -1186,31 +1258,31 @@ def next_pos():
 if show_risk and "flood_risk_0to1" in paths and os.path.exists(paths["flood_risk_0to1"]):
     p = paths["flood_risk_0to1"]
     img, (rvmin, rvmax) = raster_to_rgba_image_cached(p, cmap_name=CMAPS["flood_risk_0to1"], overlay_style=overlay_style)
-    add_image_overlay(m, img, raster_bounds_latlon(p), "Flood risk (0–1)", opacity=overlay_opacity, overlay_style=overlay_style)
+    add_image_overlay(m, img, raster_bounds_latlon_cached(p), "Flood risk (0–1)", opacity=overlay_opacity, overlay_style=overlay_style)
     add_onmap_legend(m, make_continuous_legend_png_cached(CMAPS["flood_risk_0to1"], rvmin, rvmax, "Flood risk (0–1)"), position=next_pos())
 
 if show_dist and "dist_to_river_m" in paths and os.path.exists(paths["dist_to_river_m"]):
     p = paths["dist_to_river_m"]
     img, (dvmin, dvmax) = raster_to_rgba_image_cached(p, cmap_name=CMAPS["dist_to_river_m"], overlay_style=overlay_style)
-    add_image_overlay(m, img, raster_bounds_latlon(p), "Distance to river (m)", opacity=overlay_opacity, overlay_style=overlay_style)
+    add_image_overlay(m, img, raster_bounds_latlon_cached(p), "Distance to river (m)", opacity=overlay_opacity, overlay_style=overlay_style)
     add_onmap_legend(m, make_continuous_legend_png_cached(CMAPS["dist_to_river_m"], dvmin, dvmax, "Distance to river (m)"), position=next_pos())
 
 if show_dd and "drainage_density_km_per_km2" in paths and os.path.exists(paths["drainage_density_km_per_km2"]):
     p = paths["drainage_density_km_per_km2"]
     img, (ddvmin, ddvmax) = raster_to_rgba_image_cached(p, cmap_name=CMAPS["drainage_density_km_per_km2"], overlay_style=overlay_style)
-    add_image_overlay(m, img, raster_bounds_latlon(p), "Drainage density (km/km²)", opacity=overlay_opacity, overlay_style=overlay_style)
+    add_image_overlay(m, img, raster_bounds_latlon_cached(p), "Drainage density (km/km²)", opacity=overlay_opacity, overlay_style=overlay_style)
     add_onmap_legend(m, make_continuous_legend_png_cached(CMAPS["drainage_density_km_per_km2"], ddvmin, ddvmax, "Drainage density (km/km²)"), position=next_pos())
 
 if show_soil and "soil_sand_pct" in paths and os.path.exists(paths["soil_sand_pct"]):
     p = paths["soil_sand_pct"]
     img, (svmin, svmax) = raster_to_rgba_image_cached(p, cmap_name=CMAPS["soil_sand_pct"], overlay_style=overlay_style)
-    add_image_overlay(m, img, raster_bounds_latlon(p), "Soil sand fraction (%)", opacity=overlay_opacity, overlay_style=overlay_style)
+    add_image_overlay(m, img, raster_bounds_latlon_cached(p), "Soil sand fraction (%)", opacity=overlay_opacity, overlay_style=overlay_style)
     add_onmap_legend(m, make_continuous_legend_png_cached(CMAPS["soil_sand_pct"], svmin, svmax, "Soil sand fraction (%)"), position=next_pos())
 
 if show_lulc and "lulc_worldcover_proxy" in paths and os.path.exists(paths["lulc_worldcover_proxy"]):
     p = paths["lulc_worldcover_proxy"]
     img, _ = raster_to_rgba_image_cached(p, cmap_name=CMAPS["lulc_worldcover_proxy"], overlay_style=overlay_style)
-    add_image_overlay(m, img, raster_bounds_latlon(p), "LULC (worldcover proxy)", opacity=overlay_opacity, overlay_style=overlay_style)
+    add_image_overlay(m, img, raster_bounds_latlon_cached(p), "LULC (worldcover proxy)", opacity=overlay_opacity, overlay_style=overlay_style)
     add_onmap_legend(m, make_lulc_legend_png_cached(), position=next_pos())
 
 
