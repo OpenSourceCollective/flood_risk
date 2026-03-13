@@ -768,6 +768,15 @@ normalize_weights = st.sidebar.checkbox("Normalize weights to sum to 1", value=T
 # defaults: all weights equal at 0.25
 w_defaults = {"dist": 0.25, "drainage": 0.25, "soil": 0.25, "lulc": 0.25}
 
+# Apply deferred weight sync BEFORE slider instantiation
+if "_pending_weight_sync" in st.session_state:
+    _pw = st.session_state.pop("_pending_weight_sync")
+    if isinstance(_pw, dict):
+        st.session_state["w_dist"] = float(_pw.get("dist", w_defaults["dist"]))
+        st.session_state["w_dd"] = float(_pw.get("drainage", w_defaults["drainage"]))
+        st.session_state["w_soil"] = float(_pw.get("soil", w_defaults["soil"]))
+        st.session_state["w_lulc"] = float(_pw.get("lulc", w_defaults["lulc"]))
+
 w_dist = st.sidebar.slider("Weight: Distance to waterways", 0.0, 1.0, float(w_defaults["dist"]), 0.01, key="w_dist")
 w_dd   = st.sidebar.slider("Weight: Drainage density",      0.0, 1.0, float(w_defaults["drainage"]), 0.01, key="w_dd")
 w_soil = st.sidebar.slider("Weight: Soil infiltration",     0.0, 1.0, float(w_defaults["soil"]), 0.01, key="w_soil")
@@ -845,13 +854,9 @@ def _run_fetch_physical_direct(place: str, progress_callback=None) -> str:
         sys.argv = orig_argv
 
 def _sync_weight_sliders(weights: dict) -> None:
-    """Update slider state to match the weights actually used in computation."""
-    if not isinstance(weights, dict):
-        return
-    st.session_state["w_dist"] = float(weights.get("dist", st.session_state.get("w_dist", w_defaults["dist"])))
-    st.session_state["w_dd"] = float(weights.get("drainage", st.session_state.get("w_dd", w_defaults["drainage"])))
-    st.session_state["w_soil"] = float(weights.get("soil", st.session_state.get("w_soil", w_defaults["soil"])))
-    st.session_state["w_lulc"] = float(weights.get("lulc", st.session_state.get("w_lulc", w_defaults["lulc"])))
+    """Defer slider sync to next rerun (before widgets are instantiated)."""
+    if isinstance(weights, dict):
+        st.session_state["_pending_weight_sync"] = weights
 
 if st.sidebar.button("Compute flood risk", key="btn_recompute"):
     try:
