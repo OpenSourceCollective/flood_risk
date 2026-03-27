@@ -32,6 +32,8 @@ Flood exposure is growing in many cities, yet high‑quality risk maps can be sl
 
 Outputs are stored in data/rasters and summarized in data/rasters/prepared_layers_summary.json.
 
+More details presented in [https://doi.org/10.31223/X5SJ36](https://doi.org/10.31223/X5SJ36)
+
 # Future enhancements
 
 - Add river discharge, elevation/DEM‑derived slope and other pertinent layers.
@@ -70,7 +72,7 @@ streamlit run ui.py
   - Compute flood risk with already fetched layers `python3 flood_risk_compute.py --summary data/rasters/prepared_layers_summary.json`
 
 ## Contributors
-- [Axum AI] (https://github.com/har-booh)
+
 - [Shamsudeen Abubakar](https://github.com/har-booh)
 - [Samuel Oyatoye](https://github.com/awesam1)
 - [Ayomide Owoyemi](https://github.com/Ayomidejoe)
@@ -81,4 +83,4 @@ streamlit run ui.py
 - [Taofeeq Togunwa](https://github.com/Taofeeq-T)
 - Zeenat Oyetolu
 - [Abimbola Adebakin](https://www.linkedin.com/in/abimbolaadebakin)
-- 
+-
